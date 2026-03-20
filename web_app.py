@@ -1,0 +1,1646 @@
+#!/usr/bin/env python3
+"""
+Inbotic Web Interface - Gmail-First Multi-User System
+A web interface that starts with Gmail OAuth2, then handles user registration
+"""
+import os
+import sys
+import logging
+from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional
+import asyncio
+from dotenv import load_dotenv
+
+from fastapi import FastAPI, Request, HTTPException, Depends, Form, Cookie, Response, Body, File, UploadFile
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+import uvicorn
+from urllib.parse import urlencode
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+# Load environment variables
+load_dotenv()
+
+# Import our services
+from database import get_db, create_tables, SessionLocal, User, Email, Task, GmailToken, ChatHistory
+from user_service import create_user, authenticate_user, get_user_by_username, save_gmail_token, get_gmail_token
+from auth import create_access_token, verify_token, get_password_hash
+from gmail_service import GmailService
+from google_tasks_service import GoogleTasksService
+from llm_features.llm_client import LLMClient
+import pickle
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import random
+import string
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('inbox_agent.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Create FastAPI app
+app = FastAPI(
+    title="Inbotic",
+    description="Gmail-first multi-user web interface for email to tasks automation",
+    version="3.0.0"
+)
+# Initialize Rate Limiter
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# Add Middleware
+app.add_middleware(SlowAPIMiddleware)
+
+app.add_middleware(
+    TrustedHostMiddleware, 
+    allowed_hosts=["localhost", "127.0.0.1", "0.0.0.0"]
+)
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return response
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Mount static files and templates
+app.mount("/static", StaticFiles(directory="static"), name="static")
+templates = Jinja2Templates(directory="templates")
+templates.env.globals["now"] = datetime.now
+
+# Initialize database
+create_tables()
+
+# Session management
+sessions = {}
+
+def get_current_user_from_session(request: Request):
+    """Get current user from session cookie"""
+    session_id = request.cookies.get("session_id")
+    if session_id and session_id in sessions:
+        return sessions[session_id]
+    return None
+
+def create_session(user_id: int, username: str, email: str = None):
+    """Create a new session"""
+    session_id = f"session_{user_id}_{datetime.now().timestamp()}"
+    sessions[session_id] = {
+        "user_id": user_id,
+        "username": username,
+        "email": email,
+        "created_at": datetime.now()
+    }
+    return session_id
+
+def get_user_services(user_id: int):
+    """Get Gmail and Tasks services for a user"""
+    db = SessionLocal()
+    try:
+        gmail_token = get_gmail_token(db, user_id)
+        if not gmail_token:
+            return None, None
+
+        # Create Gmail service
+        gmail_service = GmailService.from_user_token({
+            'access_token': gmail_token.access_token,
+            'refresh_token': gmail_token.refresh_token
+        })
+
+        # Create Tasks service (reuse same credentials)
+        tasks_service = GoogleTasksService.from_user_token({
+            'access_token': gmail_token.access_token,
+            'refresh_token': gmail_token.refresh_token
+        })
+
+        return gmail_service, tasks_service
+    finally:
+        db.close()
+
+@app.get("/", response_class=HTMLResponse)
+async def home(request: Request):
+    """Home page - Gmail-first approach"""
+    session_id = request.cookies.get("session_id")
+    user = get_current_user_from_session(request)
+    context = {
+        "request": request,
+        "title": "Inbotic - Gmail to Google Tasks"
+    }
+
+    if user:
+        # User is logged in - show dashboard
+        gmail_svc, tasks_svc = get_user_services(user["user_id"])
+        # Include LLM chat history in context
+        if session_id and session_id in sessions:
+            context["chat_messages"] = sessions[session_id].get("chat", [])
+
+        if gmail_svc and tasks_svc:
+            try:
+                # Get user's task lists
+                task_lists = tasks_svc.get_task_lists()
+                # Count tasks in our app's list only (more meaningful than total lists)
+                ia_title = f"Inbotic - {user['username']}"
+                ia_tasks_count = 0
+                recent_activity = "No recent activity found."
+
+                try:
+                    ia_list = next((tl for tl in task_lists if tl.get('title') == ia_title), None)
+                    if ia_list:
+                        ia_tasks = tasks_svc.get_tasks(ia_list['id'], max_results=200)
+                        ia_tasks_count = len(ia_tasks or [])
+
+                        # Get recent tasks for activity feed
+                        if ia_tasks:
+                            # Sort by updated/created if available, or just take top
+                            # Google Tasks API returns in default order (usually custom), so we take top 3
+                            recent_tasks = ia_tasks[:3]
+                            activity_lines = []
+                            for t in recent_tasks:
+                                status = "Completed" if t.get('status') == 'completed' else "Created"
+                                title = t.get('title', 'Untitled task')
+                                activity_lines.append(f"{status}: {title}")
+
+                            if activity_lines:
+                                recent_activity = " | ".join(activity_lines)
+                    else:
+                        ia_tasks_count = 0
+                except Exception:
+                    ia_tasks_count = 0
+
+                context.update({
+                    "authenticated": True,
+                    "user": user,
+                    "task_lists": task_lists,
+                    "ia_tasks_count": ia_tasks_count,
+                    "recent_activity": recent_activity,
+                })
+            except Exception as e:
+                error_str = str(e)
+                if "invalid_grant" in error_str or "Token has been expired" in error_str:
+                    logger.warning(f"Token expired for user {user['username']}: {e}")
+                    context["error"] = "Your Google connection has expired. Please reconnect."
+                    context["needs_reauth"] = True
+                else:
+                    logger.error(f"Error loading user dashboard: {e}")
+                    context["error"] = "Error loading dashboard"
+        else:
+            context.update({
+                "authenticated": True,
+                "user": user,
+                "needs_gmail": True
+            })
+    else:
+        # User not logged in - show Gmail-first onboarding
+        context["authenticated"] = False
+        context["gmail_first"] = True
+
+    return templates.TemplateResponse("index.html", context)
+
+@app.post("/chat/send")
+@app.post("/api/chat/send")
+async def chat_send(request: Request, prompt: str = Form(None), chat_message: str = Form(None)):
+    """LLM chat endpoint; stores conversation in in-memory session and redirects to home."""
+    session_id = request.cookies.get("session_id")
+    if not session_id or session_id not in sessions:
+        return RedirectResponse("/login", status_code=302)
+
+    # Initialize history
+    history = sessions[session_id].setdefault("chat", [])
+
+    # Build messages for LLM from history (capped length) with a guiding system prompt
+    messages = []
+
+    # Try to enrich with user context (recent emails and upcoming tasks)
+    context_lines = []
+    try:
+        user = get_current_user_from_session(request)
+        gmail_svc, tasks_svc = get_user_services(user["user_id"]) if user else (None, None)
+        if gmail_svc:
+            # Try strict: unread + inbox, last 1 day; then relax
+            emails = gmail_svc.get_recent_emails(max_results=5, days_back=1, unread_only=True, inbox_only=True)
+            if not emails:
+                emails = gmail_svc.get_recent_emails(max_results=5, days_back=3, unread_only=False, inbox_only=True)
+            if not emails:
+                emails = gmail_svc.get_recent_emails(max_results=5, days_back=7, unread_only=False, inbox_only=False)
+            if emails:
+                context_lines.append("RecentEmails:")
+                for e in emails:
+                    subj = (e.get('subject') or 'No Subject')
+                    context_lines.append(f"- {subj[:120]}")
+        if tasks_svc:
+            lists = tasks_svc.get_task_lists()
+            upcoming = []
+            from datetime import datetime as _dt
+            for tl in lists:
+                for t in tasks_svc.get_tasks(tl['id'], max_results=50):
+                    due = t.get('due')
+                    if due:
+                        try:
+                            d = _dt.strptime(due[:10], '%Y-%m-%d').date()
+                            upcoming.append((d, tl.get('title'), t.get('title')))
+                        except Exception:
+                            pass
+            if upcoming:
+                upcoming.sort(key=lambda x: x[0])
+                context_lines.append("UpcomingTasks:")
+                for d, lst, title in upcoming[:10]:
+                    context_lines.append(f"- {d.isoformat()} · {lst}: {title[:100]}")
+    except Exception as _:
+        pass
+
+    system_content = (
+        "You are the Inbotic assistant. Be concise and helpful. "
+        "Use the provided context about the user's emails and tasks when relevant.\n" +
+        ("\n".join(context_lines) if context_lines else "")
+    )
+    messages.append({"role": "system", "content": system_content})
+    # Stateless chat: do NOT include previous turns in the prompt
+    # Prefer chat_message (new UI) but fall back to prompt (back-compat)
+    user_text = chat_message if chat_message is not None else (prompt or "")
+    messages.append({"role": "user", "content": user_text})
+
+    try:
+        reply = LLMClient._chat_complete(messages=messages, temperature=0.5, max_tokens=600)
+    except Exception as e:
+        reply = f"Sorry, the assistant is unavailable right now. ({e})"
+
+    # Sanitize odd special tokens and whitespace from reply
+    try:
+        import re as _re
+        reply_clean = _re.sub(r"</?s>", "", reply).strip()
+        reply = reply_clean or "(No response generated)"
+    except Exception:
+        reply = reply.strip() or "(No response generated)"
+
+    # Save back to session
+    history.append({"role": "user", "content": user_text})
+    history.append({"role": "assistant", "content": reply})
+    sessions[session_id]["chat"] = history
+
+    sessions[session_id]["chat"] = history
+
+    if "application/json" in request.headers.get("accept", ""):
+        return JSONResponse({"reply": reply, "history": history})
+    return RedirectResponse("/", status_code=302)
+
+@app.get("/auth/gmail")
+async def auth_gmail(request: Request):
+    """Initiate Gmail OAuth2 authentication (Gmail-first approach)"""
+    # Generate a temporary state for tracking
+    import uuid
+    temp_state = str(uuid.uuid4())
+
+    # Store temp state in session for tracking
+    sessions[temp_state] = {
+        "temp_state": True,
+        "created_at": datetime.now()
+    }
+
+    client_id = os.getenv("CLIENT_ID")
+    redirect_uri = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/callback")
+    if not client_id:
+        return HTMLResponse(
+            "<h1>Configuration error</h1><p>Missing CLIENT_ID environment variable.</p>",
+            status_code=500,
+        )
+    scopes = [
+        'https://www.googleapis.com/auth/gmail.readonly',
+        'https://www.googleapis.com/auth/tasks'
+    ]
+
+    params = {
+        'response_type': 'code',
+        'client_id': client_id,
+        'redirect_uri': redirect_uri,
+        'scope': ' '.join(scopes),
+        'prompt': 'consent',
+        'access_type': 'offline',
+        'state': temp_state
+    }
+
+    auth_url = f"https://accounts.google.com/o/oauth2/auth?{urlencode(params)}"
+    return RedirectResponse(auth_url)
+
+@app.get("/auth/callback")
+async def auth_callback(code: str = None, state: str = None, error: str = None):
+    """Handle OAuth2 callback - create/register user"""
+    if error:
+        return HTMLResponse(f"<h1>Authentication failed</h1><p>Error: {error}</p><p><a href='/'>Try Again</a></p>")
+
+    if not code or not state:
+        return HTMLResponse("<h1>Authentication failed</h1><p>Missing authorization code or state</p><p><a href='/'>Try Again</a></p>")
+
+    # Check if this is a temp state (Gmail-first flow)
+    if state in sessions and sessions[state].get("temp_state"):
+        return await handle_gmail_first_auth(code, state)
+    else:
+        # Legacy flow - redirect to login
+        return RedirectResponse("/login?message=Please+login+first", status_code=302)
+
+async def handle_gmail_first_auth(code: str, temp_state: str):
+    """Handle Gmail-first authentication and user registration"""
+    try:
+        # Exchange code for token
+        token_url = "https://oauth2.googleapis.com/token"
+        client_id = os.getenv("CLIENT_ID")
+        client_secret = os.getenv("CLIENT_SECRET")
+        redirect_uri = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/callback")
+
+        if not client_id or not client_secret:
+            return HTMLResponse(
+                "<h1>Configuration error</h1><p>Missing CLIENT_ID or CLIENT_SECRET environment variable.</p>",
+                status_code=500,
+            )
+
+        data = {
+            'code': code,
+            'client_id': client_id,
+            'client_secret': client_secret,
+            'redirect_uri': redirect_uri,
+            'grant_type': 'authorization_code'
+        }
+
+        import requests
+        response = requests.post(token_url, data=data)
+        response.raise_for_status()
+
+        tokens = response.json()
+
+        # Get user profile from Gmail
+        gmail_service = GmailService.from_user_token(tokens)
+        profile = gmail_service.service.users().getProfile(userId='me').execute()
+        user_email = profile['emailAddress']
+
+        # Check if user already exists
+        db = SessionLocal()
+        try:
+            existing_user = db.query(User).filter(User.email == user_email).first()
+
+            if existing_user:
+                # User exists - update their Gmail token and login
+                save_gmail_token(db, existing_user.id, tokens)
+                session_id = create_session(existing_user.id, existing_user.username, user_email)
+
+                response_redirect = RedirectResponse("http://localhost:5173/", status_code=302)
+                response_redirect.set_cookie(
+                    key="session_id",
+                    value=session_id,
+                    max_age=86400,
+                    httponly=True,
+                    samesite="lax"
+                )
+                logger.info(f"Existing user {existing_user.username} connected Gmail")
+                return response_redirect
+            else:
+                # Auto-provision a new local user using Gmail identity
+                base_username = user_email.split("@")[0]
+                username = base_username
+                suffix = 1
+                while db.query(User).filter(User.username == username).first() is not None:
+                    suffix += 1
+                    username = f"{base_username}{suffix}"
+
+                random_password = __import__("secrets").token_urlsafe(12)
+                hashed_password = get_password_hash(random_password)
+
+                new_user = User(
+                    email=user_email,
+                    username=username,
+                    hashed_password=hashed_password
+                )
+                db.add(new_user)
+                db.commit()
+                db.refresh(new_user)
+
+                # Save Gmail tokens and start a session
+                save_gmail_token(db, new_user.id, tokens)
+                session_id = create_session(new_user.id, new_user.username, user_email)
+
+                response_redirect = RedirectResponse("http://localhost:5173/", status_code=302)
+                response_redirect.set_cookie(
+                    key="session_id",
+                    value=session_id,
+                    max_age=86400,
+                    httponly=True,
+                    samesite="lax"
+                )
+                logger.info(f"Auto-provisioned user {username} from Gmail {user_email}")
+                return response_redirect
+
+        finally:
+            db.close()
+
+    except Exception as e:
+        logger.error(f"OAuth2 callback failed: {e}")
+        return HTMLResponse(f"<h1>Authentication failed</h1><p>Error: {e}</p><p><a href='/'>Try Again</a></p>")
+
+@app.post("/register")
+async def register(
+    request: Request,
+    response: Response,
+    email: str = Form(...),
+    username: str = Form(...),
+    password: str = Form(...),
+    confirm_password: str = Form(...),
+    state: str = Form(None)
+):
+    """Handle user registration - enhanced for Gmail-first flow"""
+    if password != confirm_password:
+        return RedirectResponse("/register?error=Passwords+do+not+match", status_code=302)
+
+    if len(password) < 6:
+        return RedirectResponse("/register?error=Password+must+be+at+least+6+characters", status_code=302)
+
+    db = SessionLocal()
+    try:
+        # Check if user already exists
+        existing_user = db.query(User).filter(
+            (User.email == email) | (User.username == username)
+        ).first()
+
+        if existing_user:
+            return RedirectResponse("/register?error=Username+or+email+already+exists", status_code=302)
+
+        # Create new user
+        hashed_password = get_password_hash(password)
+        new_user = User(
+            email=email,
+            username=username,
+            hashed_password=hashed_password
+        )
+        db.add(new_user)
+        db.commit()
+        db.refresh(new_user)
+
+        # If Gmail was connected first, save the tokens
+        if state and state in sessions:
+            session_data = sessions[state]
+            if session_data.get("gmail_tokens"):
+                save_gmail_token(db, new_user.id, session_data["gmail_tokens"])
+
+        # Create session
+        session_id = create_session(new_user.id, new_user.username, email)
+
+        # Prepare redirect and set session cookie on the redirect response
+        redirect_resp = RedirectResponse("/", status_code=302)
+        redirect_resp.set_cookie(
+            key="session_id",
+            value=session_id,
+            max_age=86400,
+            httponly=True,
+            samesite="lax"
+        )
+
+        # Clean up temp state
+        if state and state in sessions:
+            del sessions[state]
+
+        logger.info(f"User {username} registered successfully")
+        return redirect_resp
+    finally:
+        db.close()
+
+@app.post("/login")
+@app.post("/api/login")
+@limiter.limit("5/minute")
+async def login(
+    request: Request,
+    response: Response,
+    username: str = Form(...),
+    password: str = Form(...)
+):
+    """Handle user login"""
+    db = SessionLocal()
+    try:
+        user = authenticate_user(db, username, password)
+        if not user:
+            # For API requests, return JSON error
+            if "application/json" in request.headers.get("accept", "") or request.url.path.startswith("/api/"):
+                return JSONResponse({"success": False, "message": "Invalid credentials"}, status_code=401)
+            return RedirectResponse("/login?error=Invalid+credentials", status_code=302)
+
+        # Create session
+        session_id = create_session(user.id, user.username, user.email)
+
+        logger.info(f"User {username} logged in successfully")
+
+        # Check if this is an API request
+        if "application/json" in request.headers.get("accept", "") or request.url.path.startswith("/api/"):
+            response = JSONResponse({
+                "success": True,
+                "user": {
+                    "username": user.username,
+                    "email": user.email,
+                    "profile_photo": user.profile_photo
+                }
+            })
+            response.set_cookie(
+                key="session_id",
+                value=session_id,
+                max_age=86400,
+                httponly=True,
+                samesite="lax"
+            )
+            return response
+
+        # Prepare redirect and set session cookie on the redirect response
+        redirect_resp = RedirectResponse("/", status_code=302)
+        redirect_resp.set_cookie(
+            key="session_id",
+            value=session_id,
+            max_age=86400,
+            httponly=True,
+            samesite="lax"
+        )
+        return redirect_resp
+    finally:
+        db.close()
+
+@app.get("/logout")
+async def logout(response: Response):
+    """Handle user logout"""
+    redirect_resp = RedirectResponse("/", status_code=302)
+    redirect_resp.delete_cookie(key="session_id")
+    return redirect_resp
+
+@app.post("/process-emails")
+@app.post("/api/process-emails")
+async def process_emails(
+    request: Request,
+    days_back: int = Form(7),
+    max_emails: int = Form(10),
+    pre_reminder_days: int = Form(1),
+    max_days_ahead: int = Form(60)
+):
+    """Manually trigger email processing for current user"""
+    user = get_current_user_from_session(request)
+    if not user:
+        return RedirectResponse("/login", status_code=302)
+
+    gmail_svc, tasks_svc = get_user_services(user["user_id"])
+    if not gmail_svc or not tasks_svc:
+        return RedirectResponse("/?error=Gmail+not+connected", status_code=302)
+
+    try:
+        # Get recent emails
+        emails = gmail_svc.get_recent_emails(max_results=max_emails, days_back=days_back)
+
+        if not emails:
+            if "application/json" in request.headers.get("accept", ""):
+                return JSONResponse({"message": "No emails found", "processed_count": 0, "total_emails": 0})
+            return RedirectResponse("/?message=No+emails+found", status_code=302)
+
+        # Get or create task list for this user
+        # Get or create task list for this user
+        task_list = tasks_svc.get_or_create_task_list(f"Inbotic - {user['username']}")
+        if not task_list:
+            if "application/json" in request.headers.get("accept", ""):
+                return JSONResponse({"error": "Failed to create task list"}, status_code=500)
+            return RedirectResponse("/?error=Failed+to+create+task+list", status_code=302)
+
+        task_list_id = task_list['id']
+        processed_count = 0
+
+        # Process each email (only create tasks when a deadline is detected)
+        for email in emails:
+            try:
+                tasks = tasks_svc.create_tasks_from_email(
+                    task_list_id=task_list_id,
+                    email_data=email,
+                    extract_deadlines=True,
+                    max_days_ahead=max_days_ahead,
+                    default_due_time_utc="09:00:00.000Z",
+                    create_action_tasks=False,
+                    pre_reminder_days=pre_reminder_days,
+                    create_pre_reminder=True
+                )
+                # Check if this was a dedupe (task already exists) - don't use LLM
+                is_dedupe = tasks and len(tasks) == 1 and tasks[0].get('dedupe')
+                
+                if not tasks:
+                    # Fallback to LLM extraction if regex failed
+                    logger.info(f"Regex failed for email {email.get('id')}, trying LLM extraction...")
+                    llm_task = LLMClient.extract_task_from_email(email.get('body', ''), email.get('subject', ''))
+                    
+                    if llm_task and llm_task.get('title'):
+                        # Create task from LLM data
+                        new_task = tasks_svc.create_task(
+                            task_list_id=task_list_id,
+                            title=llm_task.get('title'),
+                            notes=f"Source: {email.get('subject')}\n{llm_task.get('description', '')}\nLink: https://mail.google.com/mail/u/0/#inbox/{email.get('id')}",
+                            due_date=llm_task.get('due_date')
+                        )
+                        if new_task:
+                            tasks = [new_task]
+                            logger.info(f"LLM extracted task: {new_task.get('title')}")
+
+                # Count as processed if tasks were created OR dedupe found existing task
+                if tasks and not is_dedupe:
+                    processed_count += 1
+
+            except Exception as e:
+                logger.error(f"Error processing email {email.get('id', 'unknown')}: {e}")
+                continue
+
+        message = f"Successfully processed {processed_count} out of {len(emails)} emails"
+        if "application/json" in request.headers.get("accept", ""):
+            return JSONResponse({"message": message, "processed_count": processed_count, "total_emails": len(emails)})
+        return RedirectResponse(f"/?message={message}", status_code=302)
+
+    except Exception as e:
+        logger.error(f"Error processing emails: {e}")
+        if "application/json" in request.headers.get("accept", ""):
+            return JSONResponse({"error": str(e)}, status_code=500)
+        return RedirectResponse(f"/?error=Error+processing+emails", status_code=302)
+
+@app.get("/tasks", response_class=HTMLResponse)
+async def view_tasks(request: Request):
+    """View tasks for current user"""
+    user = get_current_user_from_session(request)
+    if not user:
+        return RedirectResponse("/login", status_code=302)
+
+    gmail_svc, tasks_svc = get_user_services(user["user_id"])
+    if not gmail_svc or not tasks_svc:
+        return RedirectResponse("/?error=Gmail+not+connected", status_code=302)
+
+    try:
+        # Get user's task lists
+        task_lists = tasks_svc.get_task_lists()
+
+        # Get tasks from each list
+        all_tasks = []
+        for task_list in task_lists:
+            tasks = tasks_svc.get_tasks(task_list['id'], max_results=50)
+            for task in tasks:
+                task['list_name'] = task_list['title']
+                all_tasks.append(task)
+
+        context = {
+            "request": request,
+            "authenticated": True,
+            "user": user,
+            "task_lists": task_lists,
+            "tasks": all_tasks,
+            "title": "Inbotic - My Tasks"
+        }
+
+        return templates.TemplateResponse("tasks.html", context)
+
+    except Exception as e:
+        logger.error(f"Error loading tasks: {e}")
+        return RedirectResponse(f"/?error=Error+loading+tasks", status_code=302)
+
+@app.get("/tasks/review", response_class=HTMLResponse)
+async def review_tasks(request: Request):
+    """Use LLM to review current user's tasks and produce a concise plan in markdown."""
+    user = get_current_user_from_session(request)
+    if not user:
+        return RedirectResponse("/login", status_code=302)
+
+    gmail_svc, tasks_svc = get_user_services(user["user_id"])
+    if not tasks_svc:
+        return RedirectResponse("/?error=Gmail+not+connected", status_code=302)
+
+    try:
+        task_lists = tasks_svc.get_task_lists()
+        collected = []
+        for tl in task_lists:
+            tasks = tasks_svc.get_tasks(tl['id'], max_results=100)
+            for t in tasks:
+                due = t.get('due')
+                if due:
+                    # Normalize to YYYY-MM-DD
+                    due = due.split('T')[0]
+                collected.append({
+                    "title": t.get('title'),
+                    "due": due,
+                    "list": tl.get('title'),
+                    "status": t.get('status')
+                })
+
+        md = LLMClient.review_tasks(collected)
+        context = {
+            "request": request,
+            "authenticated": True,
+            "user": user,
+            "markdown": md,
+            "title": "Inbotic - AI Task Review"
+        }
+        return templates.TemplateResponse("review.html", context)
+    except Exception as e:
+        logger.error(f"Error during LLM task review: {e}")
+        return RedirectResponse(f"/tasks?error=Error+reviewing+tasks", status_code=302)
+
+@app.get("/api/tasks/review")
+async def api_review_tasks(request: Request):
+    """API endpoint to get LLM task review in markdown"""
+    user = get_current_user_from_session(request)
+    if not user:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+
+    gmail_svc, tasks_svc = get_user_services(user["user_id"])
+    if not tasks_svc:
+        return JSONResponse({"error": "Gmail/Tasks not connected"}, status_code=400)
+
+    try:
+        task_lists = tasks_svc.get_task_lists()
+        collected = []
+        for tl in task_lists:
+            tasks = tasks_svc.get_tasks(tl['id'], max_results=100)
+            for t in tasks:
+                due = t.get('due')
+                if due:
+                    due = due.split('T')[0]
+                
+                # Extract Gmail link from notes if present
+                notes = t.get('notes', '')
+                link = None
+                if 'Link: https://mail.google.com' in notes:
+                    import re
+                    link_match = re.search(r'Link: (https://mail.google.com[^\s]+)', notes)
+                    if link_match:
+                        link = link_match.group(1)
+
+                collected.append({
+                    "title": t.get('title'),
+                    "due": due,
+                    "list": tl.get('title'),
+                    "status": t.get('status'),
+                    "link": link
+                })
+
+        logger.info(f"AI Review: Collected {len(collected)} tasks for review")
+        if collected:
+            logger.info(f"Sample task: {collected[0]}")
+        
+        md = LLMClient.review_tasks(collected)
+        
+        # Save chat history
+        db = SessionLocal()
+        try:
+            # Save user request (implicit)
+            user_msg = ChatHistory(
+                user_id=user["user_id"],
+                role="user",
+                content="Generate AI Task Review"
+            )
+            db.add(user_msg)
+            
+            # Save assistant response
+            ai_msg = ChatHistory(
+                user_id=user["user_id"],
+                role="assistant",
+                content=md
+            )
+            db.add(ai_msg)
+            db.commit()
+        except Exception as e:
+            logger.error(f"Failed to save chat history: {e}")
+        finally:
+            db.close()
+
+        return JSONResponse({"markdown": md})
+    except Exception as e:
+        logger.error(f"Error during API task review: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+# Removed Jinja2 routes: /, /emails, /profile to support React frontend
+# These paths should be handled by the frontend router, with data fetched from API endpoints.
+
+@app.post("/profile/update-username")
+@app.post("/api/profile/update-username")
+async def update_username(request: Request, new_username: str = Form(...)):
+    """Allow a logged-in user to change their username"""
+    user_session = get_current_user_from_session(request)
+    if not user_session:
+        return RedirectResponse("/login", status_code=302)
+
+    new_username = new_username.strip()
+    # Basic validation
+    import re
+    if len(new_username) < 3 or len(new_username) > 30 or not re.match(r"^[A-Za-z0-9_.-]+$", new_username):
+        return RedirectResponse("/profile?error=Invalid+username+format", status_code=302)
+
+    db = SessionLocal()
+    try:
+        # Check uniqueness
+        existing = db.query(User).filter(User.username == new_username).first()
+        if existing and existing.id != user_session["user_id"]:
+            return RedirectResponse("/profile?error=Username+already+taken", status_code=302)
+
+        db_user = db.query(User).filter(User.id == user_session["user_id"]).first()
+        if not db_user:
+            return RedirectResponse("/login", status_code=302)
+
+        old_username = db_user.username
+        db_user.username = new_username
+        db.commit()
+
+        # Update session username
+        session_id = request.cookies.get("session_id")
+        if session_id and session_id in sessions:
+            sessions[session_id]["username"] = new_username
+
+        if "application/json" in request.headers.get("accept", ""):
+            return JSONResponse({"message": "Username updated", "username": new_username})
+        return RedirectResponse("/profile?message=Username+updated", status_code=302)
+    except Exception as e:
+        logger.error(f"Error updating username: {e}")
+        db.rollback()
+        if "application/json" in request.headers.get("accept", ""):
+            return JSONResponse({"error": "Failed to update username"}, status_code=500)
+        return RedirectResponse("/profile?error=Failed+to+update+username", status_code=302)
+    finally:
+        db.close()
+
+@app.post("/profile/update-password")
+@app.post("/api/profile/update-password")
+async def update_password(request: Request, new_password: str = Form(...), confirm_password: str = Form(...)):
+    """Allow a logged-in user to set or change their password.
+
+    For simplicity and to support Gmail-connected users who don't know a current password,
+    this does not require the current password while the user is already authenticated.
+    """
+    user_session = get_current_user_from_session(request)
+    if not user_session:
+        return RedirectResponse("/login", status_code=302)
+
+    if new_password != confirm_password:
+        return RedirectResponse("/profile?error=Passwords+do+not+match", status_code=302)
+    if len(new_password) < 6:
+        return RedirectResponse("/profile?error=Password+must+be+at+least+6+characters", status_code=302)
+
+    db = SessionLocal()
+    try:
+        db_user = db.query(User).filter(User.id == user_session["user_id"]).first()
+        if not db_user:
+            return RedirectResponse("/login", status_code=302)
+
+        # Hash and save new password
+        hashed = get_password_hash(new_password)
+        db_user.hashed_password = hashed
+        db.commit()
+
+        if "application/json" in request.headers.get("accept", ""):
+            return JSONResponse({"message": "Password updated"})
+        return RedirectResponse("/profile?message=Password+updated", status_code=302)
+    except Exception as e:
+        logger.error(f"Error updating password: {e}")
+        db.rollback()
+        if "application/json" in request.headers.get("accept", ""):
+            return JSONResponse({"error": "Failed to update password"}, status_code=500)
+        return RedirectResponse("/profile?error=Failed+to+update+password", status_code=302)
+    finally:
+        db.close()
+
+@app.post("/profile/update-photo")
+@app.post("/api/profile/update-photo")
+async def update_photo(request: Request, file: UploadFile = File(...)):
+    """Allow a logged-in user to upload a profile photo"""
+    user_session = get_current_user_from_session(request)
+    if not user_session:
+        if "application/json" in request.headers.get("accept", ""):
+            return JSONResponse({"error": "Not authenticated"}, status_code=401)
+        return RedirectResponse("/login", status_code=302)
+
+    # Validate file type and size (max 5MB)
+    if not file.content_type or not file.content_type.startswith("image/"):
+        if "application/json" in request.headers.get("accept", ""):
+            return JSONResponse({"error": "Only image files are allowed"}, status_code=400)
+        return RedirectResponse("/profile?error=Invalid+file+type", status_code=302)
+    
+    # Read file content to check size
+    file_content = await file.read()
+    if len(file_content) > 5 * 1024 * 1024:  # 5MB max
+        if "application/json" in request.headers.get("accept", ""):
+            return JSONResponse({"error": "File size too large. Maximum 5MB allowed."}, status_code=400)
+        return RedirectResponse("/profile?error=File+too+large", status_code=302)
+
+    # Create uploads directory if it doesn't exist
+    upload_dir = "static/uploads"
+    os.makedirs(upload_dir, exist_ok=True)
+
+    # Generate unique filename with user ID and timestamp
+    import uuid
+    from datetime import datetime
+    file_extension = os.path.splitext(file.filename)[1].lower()
+    filename = f"{user_session['user_id']}_{int(datetime.now().timestamp())}{file_extension}"
+    file_path = os.path.join(upload_dir, filename)
+
+    try:
+        # Save the file
+        with open(file_path, "wb") as buffer:
+            buffer.write(file_content)
+    except Exception as e:
+        logger.error(f"Error saving file: {e}")
+        if "application/json" in request.headers.get("accept", ""):
+            return JSONResponse({"error": "Failed to save file"}, status_code=500)
+        return RedirectResponse("/profile?error=Failed+to+save+file", status_code=302)
+
+    db = SessionLocal()
+    try:
+        db_user = db.query(User).filter(User.id == user_session["user_id"]).first()
+        if not db_user:
+            if "application/json" in request.headers.get("accept", ""):
+                return JSONResponse({"error": "User not found"}, status_code=404)
+            return RedirectResponse("/login", status_code=302)
+
+        # Store relative path for serving
+        profile_photo_path = f"/static/uploads/{filename}"
+        
+        # Update user profile photo path in database
+        db_user.profile_photo = profile_photo_path
+        db.commit()
+        db.refresh(db_user)
+
+        # Update session with new photo
+        if user_session:
+            user_session["profile_photo"] = profile_photo_path
+
+        # Return the full URL for the frontend
+        base_url = str(request.base_url).rstrip('/')
+        full_photo_url = f"{base_url}{profile_photo_path}"
+
+        if "application/json" in request.headers.get("accept", ""):
+            return JSONResponse({
+                "message": "Profile photo updated",
+                "profile_photo": profile_photo_path,
+                "full_photo_url": full_photo_url
+            })
+            
+        return RedirectResponse("/profile?message=Profile+photo+updated", status_code=302)
+    except Exception as e:
+        logger.error(f"Error updating profile photo: {e}")
+        db.rollback()
+        # Clean up the uploaded file if database update failed
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        except Exception as cleanup_error:
+            logger.error(f"Error cleaning up file: {cleanup_error}")
+            
+        if "application/json" in request.headers.get("accept", ""):
+            return JSONResponse({"error": "Failed to update profile photo"}, status_code=500)
+        return RedirectResponse("/profile?error=Failed+to+update+profile+photo", status_code=302)
+    finally:
+        db.close()
+
+# Forgot Password Endpoints
+
+@app.post("/api/forgot-password")
+async def forgot_password(request: Request, email: str = Form(...)):
+    """Initiate password reset flow"""
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            # Don't reveal if user exists
+            return JSONResponse({"message": "If an account exists, an OTP has been sent."})
+
+        # Generate OTP
+        otp = ''.join(random.choices(string.digits, k=6))
+        user.reset_token = otp
+        user.reset_token_expires = datetime.utcnow() + timedelta(minutes=15)
+        db.commit()
+
+        # Send Email
+        smtp_email = os.getenv("SMTP_EMAIL")
+        smtp_password = os.getenv("SMTP_PASSWORD")
+        smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+        smtp_port = int(os.getenv("SMTP_PORT", "587"))
+
+        if smtp_email and smtp_password:
+            try:
+                msg = MIMEMultipart()
+                msg['From'] = smtp_email
+                msg['To'] = email
+                msg['Subject'] = "Inbotic - Password Reset OTP"
+
+                body = f"Your OTP for password reset is: {otp}\n\nThis OTP is valid for 15 minutes."
+                msg.attach(MIMEText(body, 'plain'))
+
+                server = smtplib.SMTP(smtp_server, smtp_port)
+                server.starttls()
+                server.login(smtp_email, smtp_password)
+                text = msg.as_string()
+                server.sendmail(smtp_email, email, text)
+                server.quit()
+                logger.info(f"Sent OTP to {email}")
+            except Exception as e:
+                logger.error(f"Failed to send email: {e}")
+                # Fallback logging for testing
+                logger.info(f"DEV MODE OTP for {email}: {otp}")
+        else:
+            logger.warning("SMTP not configured. Logging OTP.")
+            logger.info(f"DEV MODE OTP for {email}: {otp}")
+
+        return JSONResponse({"message": "If an account exists, an OTP has been sent."})
+    except Exception as e:
+        logger.error(f"Error in forgot password: {e}")
+        return JSONResponse({"error": "An error occurred"}, status_code=500)
+    finally:
+        db.close()
+
+@app.post("/api/reset-password")
+async def reset_password(
+    request: Request, 
+    email: str = Form(...), 
+    otp: str = Form(...), 
+    new_password: str = Form(...)
+):
+    """Reset password using OTP"""
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            return JSONResponse({"error": "Invalid request"}, status_code=400)
+
+        # Check OTP and Expiry
+        if not user.reset_token or user.reset_token != otp:
+            return JSONResponse({"error": "Invalid OTP"}, status_code=400)
+        
+        if user.reset_token_expires < datetime.utcnow():
+            return JSONResponse({"error": "OTP expired"}, status_code=400)
+
+        # Update Password
+        hashed = get_password_hash(new_password)
+        user.hashed_password = hashed
+        user.reset_token = None
+        user.reset_token_expires = None
+        db.commit()
+
+        return JSONResponse({"success": True, "message": "Password reset successfully"})
+    except Exception as e:
+        logger.error(f"Error resetting password: {e}")
+        return JSONResponse({"error": "Failed to reset password"}, status_code=500)
+    finally:
+        db.close()
+
+
+@app.get("/debug-session", response_class=HTMLResponse)
+async def debug_session(request: Request):
+    """Debug endpoint to check session and cookies"""
+    session_id = request.cookies.get("session_id")
+    user = get_current_user_from_session(request)
+
+    debug_info = {
+        "session_id": session_id,
+        "user": user,
+        "all_sessions": list(sessions.keys()),
+        "all_cookies": dict(request.cookies)
+    }
+
+    return HTMLResponse(f"""
+    <h1>Session Debug Info</h1>
+    <pre>{debug_info}</pre>
+    <p><a href="/">Go to Home</a></p>
+    <p><a href="/login">Go to Login</a></p>
+    """)
+
+if __name__ == "__main__":
+    uvicorn.run("web_app:app", host="0.0.0.0", port=8000, reload=True)
+
+# API Endpoints
+
+@app.get("/api/me")
+async def api_me(request: Request):
+    user = get_current_user_from_session(request)
+    if not user:
+        return JSONResponse({"authenticated": False}, status_code=401)
+    
+    # Make user dict JSON serializable
+    user_data = user.copy()
+    if "created_at" in user_data and hasattr(user_data["created_at"], "isoformat"):
+        user_data["created_at"] = user_data["created_at"].isoformat()
+        
+    # Check for connected Gmail tokens
+    db = SessionLocal()
+    try:
+        has_tokens = db.query(GmailToken).filter(GmailToken.user_id == user["user_id"]).first() is not None
+        user_data["gmail_tokens_connected"] = has_tokens
+    finally:
+        db.close()
+
+    return JSONResponse({"authenticated": True, "user": user_data})
+
+
+@app.post("/api/logout")
+async def api_logout():
+    resp = JSONResponse({"success": True})
+    resp.delete_cookie(key="session_id")
+    return resp
+
+@app.get("/api/dashboard")
+async def api_dashboard(request: Request):
+    user = get_current_user_from_session(request)
+    if not user:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+        
+    gmail_svc, tasks_svc = get_user_services(user["user_id"])
+    
+    # Make user dict JSON serializable
+    user_data = user.copy()
+    if "created_at" in user_data and hasattr(user_data["created_at"], "isoformat"):
+        user_data["created_at"] = user_data["created_at"].isoformat()
+
+    data = {
+        "user": user_data,
+        "gmail_connected": False,
+        "ia_tasks_count": 0,
+        "task_lists": [],
+        "emails_this_week": 0,
+        "pending_tasks": 0
+    }
+    
+    if gmail_svc and tasks_svc:
+        data["gmail_connected"] = True
+        try:
+            task_lists = tasks_svc.get_task_lists()
+            data["task_lists"] = task_lists
+            
+            ia_title = f"Inbotic - {user['username']}"
+            ia_list = next((tl for tl in task_lists if tl.get('title') == ia_title), None)
+            if ia_list:
+                ia_tasks = tasks_svc.get_tasks(ia_list['id'], max_results=50)
+                data["ia_tasks_count"] = len(ia_tasks or [])
+                
+                # Count pending tasks only from IA list (faster)
+                pending_count = sum(1 for t in (ia_tasks or []) if t.get('status') == 'needsAction')
+                data["pending_tasks"] = pending_count
+            
+        except Exception as e:
+            error_str = str(e)
+            if "invalid_grant" in error_str or "Token has been expired" in error_str:
+                logger.warning(f"Token expired for user {user['username']}: {e}")
+                data["needs_reauth"] = True
+                data["error"] = "Your Google connection has expired. Please reconnect."
+            else:
+                logger.error(f"Error loading dashboard data: {e}")
+        
+        # Count emails this week (limit to 20 for speed)
+        if not data.get("needs_reauth"):
+            try:
+                recent_emails = gmail_svc.get_recent_emails(max_results=20, days_back=7)
+                data["emails_this_week"] = len(recent_emails) if recent_emails else 0
+            except Exception as e:
+                error_str = str(e)
+                if "invalid_grant" in error_str or "Token has been expired" in error_str:
+                    data["needs_reauth"] = True
+                    data["error"] = "Your Google connection has expired. Please reconnect."
+                logger.error(f"Error counting emails: {e}")
+            
+    return JSONResponse(data)
+
+@app.post("/api/register")
+@limiter.limit("5/minute")
+async def api_register(
+    request: Request,
+    response: Response,
+    data: dict = Body(...)
+):
+    email = data.get("email")
+    username = data.get("username")
+    password = data.get("password")
+    confirm_password = data.get("confirm_password")
+
+    if password != confirm_password:
+        return JSONResponse({"error": "Passwords do not match"}, status_code=400)
+
+    db = SessionLocal()
+    try:
+        existing_user = db.query(User).filter(
+            (User.email == email) | (User.username == username)
+        ).first()
+
+        if existing_user:
+            return JSONResponse({"error": "Username or email already exists"}, status_code=400)
+
+        hashed_password = get_password_hash(password)
+        new_user = User(
+            email=email,
+            username=username,
+            hashed_password=hashed_password
+        )
+        db.add(new_user)
+        db.commit()
+        db.refresh(new_user)
+
+        session_id = create_session(new_user.id, new_user.username, email)
+        
+        resp = JSONResponse({"success": True, "user": {"username": new_user.username, "email": new_user.email}})
+        resp.set_cookie(
+            key="session_id",
+            value=session_id,
+            max_age=86400,
+            httponly=True,
+            samesite="lax"
+        )
+        return resp
+    finally:
+        db.close()
+@app.get("/api/emails")
+async def api_emails(request: Request, days_back: int = 7):
+    user = get_current_user_from_session(request)
+    if not user:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+
+    gmail_svc, tasks_svc = get_user_services(user["user_id"])
+    
+    db = SessionLocal()
+    try:
+        # 1. Try to get from local DB first (fast load)
+        db_emails = db.query(Email).filter(Email.user_id == user["user_id"]).order_by(Email.received_at.desc()).limit(50).all()
+        
+        if db_emails and len(db_emails) > 0:
+            # Convert to dicts
+            results = []
+            for e in db_emails:
+                results.append({
+                    "id": e.gmail_message_id,
+                    "subject": e.subject,
+                    "sender": e.sender,
+                    "body": e.body,
+                    "date": e.received_at.strftime("%Y-%m-%d") if e.received_at else "",
+                    "processed": e.processed,
+                    "extracted_data": e.extracted_data
+                })
+            return JSONResponse({"emails": results})
+
+        # 2. If no local data, fetch from Google (slow but necessary first time)
+        if not gmail_svc:
+            return JSONResponse({"emails": []})
+
+        emails = gmail_svc.get_recent_emails(max_results=20, days_back=days_back)
+        
+        # Save to DB for next time
+        for email_data in emails:
+            # Check if exists
+            exists = db.query(Email).filter(
+                Email.user_id == user["user_id"], 
+                Email.gmail_message_id == email_data['id']
+            ).first()
+            
+            if not exists:
+                new_email = Email(
+                    user_id=user["user_id"],
+                    gmail_message_id=email_data['id'],
+                    subject=email_data.get('subject', 'No Subject'),
+                    sender=email_data.get('sender', 'Unknown'),
+                    body=email_data.get('body', ''),
+                    # Parse date if possible, else now
+                    received_at=datetime.now(), 
+                    processed=False
+                )
+                db.add(new_email)
+        
+        db.commit()
+        return JSONResponse({"emails": emails})
+        
+    except Exception as e:
+        logger.error(f"Error fetching emails: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+    finally:
+        db.close()
+
+@app.get("/api/tasks")
+async def api_tasks(request: Request, refresh: bool = False):
+    user = get_current_user_from_session(request)
+    if not user:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+
+    gmail_svc, tasks_svc = get_user_services(user["user_id"])
+    if not tasks_svc:
+        return JSONResponse({"task_lists": [], "tasks": []})
+
+    db = SessionLocal()
+    try:
+        # 1. Get task lists (usually fast, 1 API call)
+        task_lists = tasks_svc.get_task_lists()
+        
+        # 2. Try to get tasks from local DB (unless refreshing)
+        if not refresh:
+            db_tasks = db.query(Task).filter(Task.user_id == user["user_id"]).all()
+            
+            if db_tasks and len(db_tasks) > 0:
+                # Convert to dicts
+                all_tasks = []
+                for t in db_tasks:
+                    # Find list title
+                    list_title = "Unknown List"
+                    for tl in task_lists:
+                        if tl['id'] == t.gmail_task_list_id:
+                            list_title = tl['title']
+                            break
+                    
+                    all_tasks.append({
+                        "id": t.gmail_task_id,
+                        "title": t.title,
+                        "notes": t.description,
+                        "due": t.due_date.isoformat() if t.due_date else None,
+                        "status": t.status,
+                        "list_id": t.gmail_task_list_id,
+                        "list_name": list_title
+                    })
+                return JSONResponse({"task_lists": task_lists, "tasks": all_tasks})
+        
+        # If refreshing, clear local tasks first
+        if refresh:
+            db.query(Task).filter(Task.user_id == user["user_id"]).delete()
+            db.commit()
+
+        # 3. If no local data, fetch from Google (slow N+1 calls)
+        all_tasks = []
+        for task_list in task_lists:
+            tasks = tasks_svc.get_tasks(task_list['id'], max_results=50)
+            for task in tasks:
+                task['list_name'] = task_list['title']
+                task['list_id'] = task_list['id']
+                all_tasks.append(task)
+                
+                # Save to DB
+                exists = db.query(Task).filter(
+                    Task.user_id == user["user_id"],
+                    Task.gmail_task_id == task['id']
+                ).first()
+                
+                if not exists:
+                    # Parse due date
+                    due_date = None
+                    if task.get('due'):
+                        try:
+                            # Handle '2023-12-01T00:00:00.000Z'
+                            due_str = task.get('due').split('T')[0]
+                            due_date = datetime.strptime(due_str, "%Y-%m-%d")
+                        except:
+                            pass
+
+                    new_task = Task(
+                        user_id=user["user_id"],
+                        gmail_task_id=task['id'],
+                        gmail_task_list_id=task_list['id'],
+                        title=task.get('title', 'Untitled'),
+                        description=task.get('notes', ''),
+                        status=task.get('status', 'needsAction'),
+                        due_date=due_date
+                    )
+                    db.add(new_task)
+        
+        db.commit()
+        return JSONResponse({"task_lists": task_lists, "tasks": all_tasks})
+        
+    except Exception as e:
+        logger.error(f"Error fetching tasks: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+    finally:
+        db.close()
+
+@app.put("/api/tasks/{task_id}")
+async def api_update_task(task_id: str, request: Request, data: dict = Body(...)):
+    user = get_current_user_from_session(request)
+    if not user:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+
+    gmail_svc, tasks_svc = get_user_services(user["user_id"])
+    if not tasks_svc:
+        return JSONResponse({"error": "Tasks service not connected"}, status_code=400)
+
+    task_list_id = data.get("list_id")
+    if not task_list_id:
+        return JSONResponse({"error": "Missing task_list_id"}, status_code=400)
+
+    try:
+        # Prepare updates
+        updates = {}
+        if "title" in data:
+            updates["title"] = data["title"]
+        if "notes" in data:
+            updates["notes"] = data["notes"]
+        if "status" in data:
+            updates["status"] = data["status"]
+        if "due" in data:
+            updates["due"] = data["due"]  # Expecting YYYY-MM-DD or ISO string
+
+        updated_task = tasks_svc.update_task(task_list_id, task_id, updates)
+        if updated_task:
+            return JSONResponse({"task": updated_task})
+        else:
+            return JSONResponse({"error": "Failed to update task"}, status_code=500)
+    except Exception as e:
+        logger.error(f"Error updating task: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.delete("/api/tasks/{task_id}")
+async def api_delete_task(task_id: str, request: Request, list_id: str):
+    user = get_current_user_from_session(request)
+    if not user:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+
+    gmail_svc, tasks_svc = get_user_services(user["user_id"])
+    if not tasks_svc:
+        return JSONResponse({"error": "Tasks service not connected"}, status_code=400)
+
+    try:
+        # Delete from Google Tasks
+        success = tasks_svc.delete_task(list_id, task_id)
+        
+        if success:
+            # Also delete from local DB to prevent ghosting
+            db = SessionLocal()
+            try:
+                db.query(Task).filter(
+                    Task.user_id == user["user_id"],
+                    Task.gmail_task_id == task_id
+                ).delete()
+                db.commit()
+            except Exception as db_e:
+                logger.error(f"Error deleting task from DB: {db_e}")
+            finally:
+                db.close()
+                
+            return JSONResponse({"success": True})
+        else:
+            return JSONResponse({"error": "Failed to delete task"}, status_code=500)
+    except Exception as e:
+        logger.error(f"Error deleting task: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.get("/api/profile")
+async def api_profile(request: Request):
+    user_session = get_current_user_from_session(request)
+    if not user_session:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+
+    db = SessionLocal()
+    try:
+        db_user = db.query(User).filter(User.id == user_session["user_id"]).first()
+        if not db_user:
+            return JSONResponse({"error": "User not found"}, status_code=404)
+
+        profile_user = {
+            "username": db_user.username,
+            "email": db_user.email,
+            "profile_photo": db_user.profile_photo,
+            "created_at": db_user.created_at.isoformat() if db_user.created_at else None,
+            "updated_at": db_user.updated_at.isoformat() if db_user.updated_at else None,
+            "emails_count": len(db_user.emails) if db_user.emails else 0,
+            "tasks_count": len(db_user.tasks) if db_user.tasks else 0,
+            "gmail_tokens_count": len(db_user.gmail_tokens) if db_user.gmail_tokens else 0,
+            "gmail_tokens_connected": bool(db_user.gmail_tokens and len(db_user.gmail_tokens) > 0),
+        }
+        
+        # Calculate days active
+        if db_user.created_at and db_user.updated_at:
+            days_active = (db_user.updated_at - db_user.created_at).days
+        else:
+            days_active = 0
+        profile_user["days_active"] = days_active
+
+        return JSONResponse({"user": profile_user})
+    finally:
+        db.close()
+
+@app.post("/api/chat/send")
+async def api_chat_send(request: Request, chat_message: str = Form(...)):
+    user = get_current_user_from_session(request)
+    if not user:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+
+    gmail_svc, tasks_svc = get_user_services(user["user_id"])
+    message_lower = chat_message.lower()
+    
+    # Command: Mark task as done
+    if any(phrase in message_lower for phrase in ["mark", "complete", "done", "finish"]):
+        if tasks_svc:
+            try:
+                task_lists = tasks_svc.get_task_lists()
+                for tl in task_lists:
+                    tasks = tasks_svc.get_tasks(tl['id'], max_results=50)
+                    for t in tasks:
+                        task_title_lower = t.get('title', '').lower()
+                        # Check if the message mentions this task
+                        if any(word in message_lower for word in task_title_lower.split() if len(word) > 3):
+                            # Mark as completed
+                            tasks_svc.complete_task(tl['id'], t['id'])
+                            reply = f"✅ Marked task '{t.get('title')}' as complete!"
+                            
+                            # Save to history
+                            db = SessionLocal()
+                            try:
+                                db.add(ChatHistory(user_id=user["user_id"], role="user", content=chat_message))
+                                db.add(ChatHistory(user_id=user["user_id"], role="assistant", content=reply))
+                                db.commit()
+                            finally:
+                                db.close()
+                            return JSONResponse({"reply": reply})
+            except Exception as e:
+                logger.error(f"Error marking task complete: {e}")
+    
+    # Command: Search emails
+    if any(phrase in message_lower for phrase in ["search email", "find email", "email about", "emails about"]):
+        if gmail_svc:
+            try:
+                # Extract search terms
+                search_terms = message_lower.replace("search emails about", "").replace("search email about", "")
+                search_terms = search_terms.replace("find emails about", "").replace("find email about", "")
+                search_terms = search_terms.replace("emails about", "").replace("email about", "").strip()
+                
+                if search_terms:
+                    emails = gmail_svc.get_recent_emails(max_results=5, days_back=30, query=search_terms)
+                    if emails:
+                        reply = f"📧 Found {len(emails)} email(s) about '{search_terms}':\n\n"
+                        for e in emails:
+                            reply += f"• **{e.get('subject', 'No Subject')}** from {e.get('sender', 'Unknown')}\n"
+                        
+                        # Save to history
+                        db = SessionLocal()
+                        try:
+                            db.add(ChatHistory(user_id=user["user_id"], role="user", content=chat_message))
+                            db.add(ChatHistory(user_id=user["user_id"], role="assistant", content=reply))
+                            db.commit()
+                        finally:
+                            db.close()
+                        return JSONResponse({"reply": reply})
+                    else:
+                        reply = f"No emails found about '{search_terms}' in the last 30 days."
+                        db = SessionLocal()
+                        try:
+                            db.add(ChatHistory(user_id=user["user_id"], role="user", content=chat_message))
+                            db.add(ChatHistory(user_id=user["user_id"], role="assistant", content=reply))
+                            db.commit()
+                        finally:
+                            db.close()
+                        return JSONResponse({"reply": reply})
+            except Exception as e:
+                logger.error(f"Error searching emails: {e}")
+    
+    # Default: RAG-based response
+    context_parts = []
+    
+    # 1. Recent Emails
+    if gmail_svc:
+        try:
+            recent_emails = gmail_svc.get_recent_emails(max_results=10, days_back=7)
+            if recent_emails:
+                context_parts.append("Recent Emails:")
+                for e in recent_emails:
+                    context_parts.append(f"- From: {e.get('sender')}, Subject: {e.get('subject')}, Body Snippet: {e.get('snippet')}")
+        except Exception as e:
+            logger.error(f"Error fetching emails for chat: {e}")
+
+    # 2. Tasks
+    if tasks_svc:
+        try:
+            task_lists = tasks_svc.get_task_lists()
+            all_tasks = []
+            for tl in task_lists:
+                tasks = tasks_svc.get_tasks(tl['id'], max_results=20)
+                for t in tasks:
+                    all_tasks.append(f"- [{t.get('status')}] {t.get('title')} (Due: {t.get('due', 'None')})")
+            
+            if all_tasks:
+                context_parts.append("\nCurrent Tasks:")
+                context_parts.extend(all_tasks)
+        except Exception as e:
+            logger.error(f"Error fetching tasks for chat: {e}")
+
+    context_data = "\n".join(context_parts)
+    
+    # Generate Response
+    reply = LLMClient.chat_with_data(chat_message, context_data)
+
+    # Save History
+    db = SessionLocal()
+    try:
+        db.add(ChatHistory(user_id=user["user_id"], role="user", content=chat_message))
+        db.add(ChatHistory(user_id=user["user_id"], role="assistant", content=reply))
+        db.commit()
+    except Exception as e:
+        logger.error(f"Failed to save chat history: {e}")
+    finally:
+        db.close()
+
+    return JSONResponse({"reply": reply})
