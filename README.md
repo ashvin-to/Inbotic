@@ -33,62 +33,68 @@ Inbotic turns important Gmail messages into actionable Google Tasks through a mu
 - Node.js 18+
 - A Google Cloud project with OAuth client credentials
 
-## Backend setup (recommended first)
+## Setup
 
-### 1) Clone and enter the project
+### 1) Clone and install
 
 ```bash
 git clone <your-repo-url>
 cd inbotic
-```
-
-### 2) Create Python environment and install dependencies
-
-```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 3) Create local environment config
+### 2) Configure environment
 
 ```bash
 cp .env.example .env
 ```
 
-### 4) Configure Google OAuth and secrets
+Set at least these values in `.env`:
 
-Edit `.env` and set at minimum:
-
-- `CLIENT_ID`
-- `CLIENT_SECRET`
-- `GOOGLE_REDIRECT_URI` (default: `http://localhost:8000/auth/callback`)
 - `SECRET_KEY`
+- `GOOGLE_REDIRECT_URI` (default: `http://localhost:8000/auth/callback`)
 
-Generate a strong secret key:
+Generate `SECRET_KEY` quickly:
 
 ```bash
 python3 -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
-Create a local secrets folder and place your Google credentials JSON there:
+### 3) Choose OAuth mode
 
-```bash
-mkdir -p .secrets
-# put your credentials file at .secrets/google-credentials.json
-```
+The app supports two OAuth paths:
 
-Important:
-- Keep Google credentials outside git, e.g. `.secrets/google-credentials.json`
-- Do not commit `.env`, credential JSON, database files, or logs
+1. Hosted OAuth (recommended for end users):
+   - You set `CLIENT_ID` and `CLIENT_SECRET` on the backend.
+   - Users only click Continue with Google.
 
-### 5) Run backend
+2. Manual OAuth:
+   - Users upload OAuth JSON or paste Client ID/Secret in the setup page.
+   - Uploaded JSON is stored at `.secrets/google-credentials.json`.
+
+### 4) Run backend
 
 ```bash
 python start_web.py
 ```
 
-Open `http://localhost:8000`.
+Open `http://localhost:8000` and click Connect Gmail.
+
+## Quick start (least technical)
+
+If you just want to run locally fast:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+python start_web.py
+```
+
+Then open `http://localhost:8000` and use either hosted login or manual setup in-app.
 
 ## Frontend setup (React)
 
@@ -107,6 +113,19 @@ Build for production:
 ```bash
 npm run build
 ```
+
+## Deployment note (Vercel / Netlify)
+
+- Vercel/Netlify are great for hosting the React frontend.
+- This project's FastAPI backend (OAuth callbacks, token exchange, DB access) should be hosted on a backend platform such as Render, Railway, Fly.io, or a VPS/container host.
+- Point the frontend API base URL to your backend domain and add that backend callback URL in Google OAuth redirect URIs.
+- Manual OAuth setup is disabled by default on hosted/production deployments.
+- To enable manual mode explicitly, set `INBOTIC_ALLOW_MANUAL_OAUTH=true` on backend env vars.
+- Recommended production env vars:
+   - `CLIENT_ID`
+   - `CLIENT_SECRET`
+   - `GOOGLE_REDIRECT_URI` (your deployed callback URL)
+   - `SECRET_KEY`
 
 ## API docs
 
@@ -130,7 +149,8 @@ When backend is running, FastAPI docs are available at:
 2. Configure OAuth consent screen.
 3. Create an OAuth Client ID (Web application).
 4. Add redirect URI: `http://localhost:8000/auth/callback`.
-5. Copy client ID/secret into `.env`.
+5. For hosted OAuth, set `CLIENT_ID`/`CLIENT_SECRET` in backend env vars.
+6. For manual OAuth, download OAuth JSON and upload it in the app setup page, or paste Client ID/Secret in that page.
 
 ## Troubleshooting
 

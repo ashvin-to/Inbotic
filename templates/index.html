@@ -20,10 +20,23 @@
             </p>
             <div class="relative flex flex-wrap items-center justify-center gap-4">
                 {% if gmail_first %}
-                <a href="/auth/gmail"
+                {% if oauth_shared_available %}
+                <a href="/auth/gmail?mode=shared"
                     class="rounded-full bg-blue-600 px-6 py-3 text-sm font-semibold text-white shadow-sm hover:bg-blue-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 transition-colors">
-                    Connect Gmail & launch
+                    Continue with Google
                 </a>
+                {% endif %}
+
+                {% if oauth_manual_allowed %}
+                <a href="/auth/gmail?mode=manual"
+                    class="rounded-full bg-white/10 px-6 py-3 text-sm font-semibold text-white shadow-sm hover:bg-white/20 transition-colors">
+                    Manual OAuth setup
+                </a>
+                {% endif %}
+
+                {% if not oauth_shared_available and not oauth_manual_allowed %}
+                <p class="text-sm text-yellow-200">OAuth is not configured yet. Please contact the app administrator.</p>
+                {% endif %}
                 {% else %}
                 <a href="/login"
                     class="rounded-full bg-white/10 px-6 py-3 text-sm font-semibold text-white shadow-sm hover:bg-white/20 transition-colors">

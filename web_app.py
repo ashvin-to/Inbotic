@@ -6,9 +6,11 @@ A web interface that starts with Gmail OAuth2, then handles user registration
 import os
 import sys
 import logging
+import json
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 import asyncio
+from pathlib import Path
 from dotenv import load_dotenv
 
 from fastapi import FastAPI, Request, HTTPException, Depends, Form, Cookie, Response, Body, File, UploadFile
@@ -32,6 +34,7 @@ from auth import create_access_token, verify_token, get_password_hash
 from gmail_service import GmailService
 from google_tasks_service import GoogleTasksService
 from llm_features.llm_client import LLMClient
+from google_oauth_config import resolve_google_oauth_client_config
 import pickle
 import smtplib
 from email.mime.text import MIMEText
@@ -97,6 +100,145 @@ create_tables()
 
 # Session management
 sessions = {}
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_production_deployment() -> bool:
+    # Treat common hosting envs as production defaults.
+    return any([
+        _env_bool("INBOTIC_PRODUCTION", False),
+        bool(os.getenv("VERCEL")),
+        bool(os.getenv("NETLIFY")),
+    ])
+
+
+def _manual_oauth_allowed() -> bool:
+    # Default: enabled for local/dev, disabled for production/hosted deployments.
+    manual_default = not _is_production_deployment()
+    return _env_bool("INBOTIC_ALLOW_MANUAL_OAUTH", manual_default)
+
+
+def _has_shared_oauth_credentials() -> bool:
+    client_id, client_secret = resolve_google_oauth_client_config()
+    return bool(client_id and client_secret)
+
+
+def render_oauth_choice_page(shared_available: bool, allow_manual: bool):
+    """Render a simple chooser for hosted OAuth vs manual OAuth setup."""
+    shared_disabled = "disabled" if not shared_available else ""
+    shared_note = "" if shared_available else "<p class='muted' style='color:#b00020;'>Hosted OAuth is not configured on this server yet.</p>"
+
+    manual_card = ""
+    if allow_manual:
+        manual_card = """
+        <div class='card'>
+            <h3>Use My Own OAuth Credentials</h3>
+            <p>Upload your OAuth JSON or paste Client ID and Client Secret.</p>
+            <a class='btn secondary' href='/setup/google-credentials'>Manual Setup</a>
+        </div>
+        """
+
+    html = f"""
+    <html>
+        <head>
+            <title>Choose Sign-In Method</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 2rem; line-height: 1.5; }}
+                .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; max-width: 900px; }}
+                .card {{ border: 1px solid #ddd; border-radius: 10px; padding: 1.25rem; }}
+                .btn {{ margin-top: 0.8rem; display: inline-block; text-decoration: none; padding: 0.6rem 1rem; border-radius: 8px; background: #0a66c2; color: #fff; }}
+                .btn.secondary {{ background: #444; }}
+                .btn[disabled] {{ pointer-events: none; opacity: 0.5; }}
+                .muted {{ color: #666; font-size: 0.95rem; }}
+            </style>
+        </head>
+        <body>
+            <h1>Choose how to connect Gmail</h1>
+            <p class='muted'>You can sign in using hosted OAuth managed by this app, or configure your own Google OAuth credentials.</p>
+            <div class='grid'>
+                <div class='card'>
+                    <h3>Use Hosted OAuth</h3>
+                    <p>This is easiest for end users. They just sign in with Google.</p>
+                    {shared_note}
+                    <a class='btn' href='/auth/gmail?mode=shared' {shared_disabled}>Continue with Hosted OAuth</a>
+                </div>
+                {manual_card}
+            </div>
+        </body>
+    </html>
+    """
+    return HTMLResponse(html)
+
+
+def render_oauth_setup_page(message: str = "", is_error: bool = False):
+    """Render a simple browser-based setup page for Google OAuth credentials."""
+    status_style = "color:#b00020;" if is_error else "color:#0a7c2f;"
+    status_html = f"<p style='{status_style}'>{message}</p>" if message else ""
+
+    html = f"""
+    <html>
+        <head>
+            <title>Inbotic Setup</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 2rem; line-height: 1.5; }}
+                .card {{ max-width: 760px; border: 1px solid #ddd; border-radius: 10px; padding: 1.25rem; }}
+                .muted {{ color: #666; font-size: 0.95rem; }}
+                label {{ font-weight: 600; display: block; margin-top: 1rem; }}
+                input[type='file'], input[type='text'] {{ width: 100%; padding: 0.5rem; margin-top: 0.35rem; }}
+                button {{ margin-top: 1rem; padding: 0.6rem 1rem; border: 0; border-radius: 8px; background: #0a66c2; color: #fff; cursor: pointer; }}
+                code {{ background: #f5f5f5; padding: 0.12rem 0.3rem; border-radius: 4px; }}
+            </style>
+        </head>
+        <body>
+            <h1>One-time Google setup</h1>
+            <div class='card'>
+                <p>Use this page to configure OAuth without editing environment variables manually.</p>
+                {status_html}
+                <ol>
+                    <li>Create OAuth credentials in Google Cloud (see quick steps below).</li>
+                    <li>Either upload OAuth JSON or paste Client ID/Client Secret.</li>
+                    <li>Click Save, then Connect Gmail.</li>
+                </ol>
+
+                <div class='muted'>
+                    <p><strong>Quick Google OAuth steps</strong></p>
+                    <ol>
+                        <li>Open Google Cloud Console and create/select a project.</li>
+                        <li>Enable Gmail API and Google Tasks API.</li>
+                        <li>Configure OAuth consent screen.</li>
+                        <li>Create OAuth Client ID (Web application).</li>
+                        <li>Add redirect URI: http://localhost:8000/auth/callback</li>
+                        <li>Copy Client ID and Client Secret (or download JSON).</li>
+                    </ol>
+                </div>
+
+                <form action='/setup/google-credentials' method='post' enctype='multipart/form-data'>
+                    <label>Option A: Upload Google OAuth credentials JSON</label>
+                    <input type='file' name='credentials_file' accept='.json,application/json' />
+
+                    <p class='muted'>Option B (skip JSON): paste these values directly.</p>
+                    <label>Client ID</label>
+                    <input type='text' name='client_id' placeholder='your-google-oauth-client-id' />
+
+                    <label>Client Secret</label>
+                    <input type='text' name='client_secret' placeholder='your-google-oauth-client-secret' />
+
+                    <button type='submit'>Save and Continue</button>
+                </form>
+
+                <p class='muted'>If you upload JSON, it is saved to <code>.secrets/google-credentials.json</code>.</p>
+                <p><a href='/auth/gmail'>Back to sign-in options</a></p>
+            </div>
+        </body>
+    </html>
+    """
+    return HTMLResponse(html)
 
 def get_current_user_from_session(request: Request):
     """Get current user from session cookie"""
@@ -216,6 +358,8 @@ async def home(request: Request):
         # User not logged in - show Gmail-first onboarding
         context["authenticated"] = False
         context["gmail_first"] = True
+        context["oauth_shared_available"] = _has_shared_oauth_credentials()
+        context["oauth_manual_allowed"] = _manual_oauth_allowed()
 
     return templates.TemplateResponse("index.html", context)
 
@@ -307,8 +451,33 @@ async def chat_send(request: Request, prompt: str = Form(None), chat_message: st
     return RedirectResponse("/", status_code=302)
 
 @app.get("/auth/gmail")
-async def auth_gmail(request: Request):
+async def auth_gmail(request: Request, mode: str = None):
     """Initiate Gmail OAuth2 authentication (Gmail-first approach)"""
+    allow_manual = _manual_oauth_allowed()
+    shared_available = _has_shared_oauth_credentials()
+
+    # Let users choose between hosted OAuth and manual setup when both are enabled.
+    if mode not in {"shared", "manual"}:
+        if shared_available and allow_manual:
+            return render_oauth_choice_page(shared_available=True, allow_manual=True)
+        if shared_available and not allow_manual:
+            mode = "shared"
+        if not shared_available:
+            if not allow_manual:
+                return HTMLResponse(
+                    "<h1>OAuth not configured</h1><p>Hosted OAuth credentials are missing and manual setup is disabled on this deployment.</p>",
+                    status_code=500,
+                )
+            return RedirectResponse("/setup/google-credentials", status_code=302)
+
+    if mode == "manual":
+        if not allow_manual:
+            return HTMLResponse("<h1>Manual setup is disabled</h1>", status_code=403)
+        return RedirectResponse("/setup/google-credentials", status_code=302)
+
+    if not shared_available:
+        return RedirectResponse("/setup/google-credentials", status_code=302)
+
     # Generate a temporary state for tracking
     import uuid
     temp_state = str(uuid.uuid4())
@@ -319,13 +488,10 @@ async def auth_gmail(request: Request):
         "created_at": datetime.now()
     }
 
-    client_id = os.getenv("CLIENT_ID")
+    client_id, _ = resolve_google_oauth_client_config()
     redirect_uri = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/callback")
     if not client_id:
-        return HTMLResponse(
-            "<h1>Configuration error</h1><p>Missing CLIENT_ID environment variable.</p>",
-            status_code=500,
-        )
+        return RedirectResponse("/setup/google-credentials", status_code=302)
     scopes = [
         'https://www.googleapis.com/auth/gmail.readonly',
         'https://www.googleapis.com/auth/tasks'
@@ -343,6 +509,62 @@ async def auth_gmail(request: Request):
 
     auth_url = f"https://accounts.google.com/o/oauth2/auth?{urlencode(params)}"
     return RedirectResponse(auth_url)
+
+
+@app.get("/setup/google-credentials")
+async def setup_google_credentials_page():
+    """Beginner-friendly setup page for Google OAuth credentials."""
+    return render_oauth_setup_page()
+
+
+@app.post("/setup/google-credentials")
+async def setup_google_credentials(
+    credentials_file: UploadFile = File(None),
+    client_id: str = Form(""),
+    client_secret: str = Form(""),
+):
+    """Save Google OAuth credentials from uploaded JSON or manual inputs."""
+    client_id = (client_id or "").strip()
+    client_secret = (client_secret or "").strip()
+
+    if credentials_file and credentials_file.filename:
+        try:
+            raw_bytes = await credentials_file.read()
+            payload = json.loads(raw_bytes.decode("utf-8"))
+
+            web_block = payload.get("web") if isinstance(payload, dict) else None
+            installed_block = payload.get("installed") if isinstance(payload, dict) else None
+
+            if isinstance(web_block, dict):
+                client_id = client_id or (web_block.get("client_id") or "").strip()
+                client_secret = client_secret or (web_block.get("client_secret") or "").strip()
+            if isinstance(installed_block, dict):
+                client_id = client_id or (installed_block.get("client_id") or "").strip()
+                client_secret = client_secret or (installed_block.get("client_secret") or "").strip()
+
+            # Also support flat payload shape just in case.
+            client_id = client_id or (payload.get("client_id") or "").strip()
+            client_secret = client_secret or (payload.get("client_secret") or "").strip()
+
+            secrets_dir = Path(".secrets")
+            secrets_dir.mkdir(parents=True, exist_ok=True)
+            output_path = secrets_dir / "google-credentials.json"
+            output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            os.environ["GOOGLE_CREDENTIALS_PATH"] = str(output_path)
+        except Exception as e:
+            return render_oauth_setup_page(f"Could not read uploaded JSON: {e}", is_error=True)
+
+    if not client_id or not client_secret:
+        return render_oauth_setup_page(
+            "Missing client_id/client_secret. Upload a valid OAuth JSON file or fill both fields.",
+            is_error=True,
+        )
+
+    # Keep values in memory for this run; persisted values can be added in .env if desired.
+    os.environ["CLIENT_ID"] = client_id
+    os.environ["CLIENT_SECRET"] = client_secret
+
+    return RedirectResponse("/auth/gmail?mode=manual", status_code=302)
 
 @app.get("/auth/callback")
 async def auth_callback(code: str = None, state: str = None, error: str = None):
@@ -365,13 +587,12 @@ async def handle_gmail_first_auth(code: str, temp_state: str):
     try:
         # Exchange code for token
         token_url = "https://oauth2.googleapis.com/token"
-        client_id = os.getenv("CLIENT_ID")
-        client_secret = os.getenv("CLIENT_SECRET")
+        client_id, client_secret = resolve_google_oauth_client_config()
         redirect_uri = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/callback")
 
         if not client_id or not client_secret:
             return HTMLResponse(
-                "<h1>Configuration error</h1><p>Missing CLIENT_ID or CLIENT_SECRET environment variable.</p>",
+                "<h1>Configuration error</h1><p>Missing Google OAuth credentials. Set CLIENT_ID/CLIENT_SECRET or place your Google credentials JSON at .secrets/google-credentials.json.</p>",
                 status_code=500,
             )
 

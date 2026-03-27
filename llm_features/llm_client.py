@@ -21,11 +21,15 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=os.getenv('OPENROUTER_API_KEY'),
-    timeout=120.0
-)
+def _get_openrouter_client():
+    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if not api_key:
+        return None
+    return OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=api_key,
+        timeout=120.0,
+    )
 # Preferred model can be overridden via env; restrict to known free routes
 MAIN_MODEL = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free")
 FALLBACK_MODELS = [
@@ -46,19 +50,23 @@ class LLMClient:
     def _chat_complete(messages, temperature=0.5, max_tokens=800):
         """Call OpenRouter with model fallbacks to avoid 404s for unavailable models."""
         last_err = None
-        for model in FALLBACK_MODELS:
-            try:
-                res = client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
-                return res.choices[0].message.content.strip()
-            except Exception as e:
-                # If specific 404 for model not found, try next; otherwise remember and continue
-                last_err = e
-                continue
+        client = _get_openrouter_client()
+        if client:
+            for model in FALLBACK_MODELS:
+                try:
+                    res = client.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                    )
+                    return res.choices[0].message.content.strip()
+                except Exception as e:
+                    # If specific 404 for model not found, try next; otherwise remember and continue
+                    last_err = e
+                    continue
+        else:
+            last_err = RuntimeError("OPENROUTER_API_KEY is not set")
         
         # Fallback to Gemini if OpenRouter fails
         try:

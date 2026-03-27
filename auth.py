@@ -5,6 +5,7 @@ import os
 import hashlib
 import bcrypt
 import secrets
+import warnings
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -15,7 +16,19 @@ except Exception:
 def _require_env(name: str) -> str:
     value = os.getenv(name, "").strip()
     if not value:
-        raise RuntimeError(f"Missing required environment variable: {name}")
+        strict_env = os.getenv("INBOTIC_STRICT_ENV", "0").strip().lower() in {"1", "true", "yes"}
+        if strict_env:
+            raise RuntimeError(f"Missing required environment variable: {name}")
+
+        # Development fallback to keep local startup usable without a configured .env.
+        value = secrets.token_urlsafe(48)
+        os.environ[name] = value
+        warnings.warn(
+            f"Missing required environment variable: {name}. "
+            "Using a temporary in-memory key for this session.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     return value
 
 

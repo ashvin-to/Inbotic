@@ -1,20 +1,20 @@
-# 📧 Inbotic - Web Interface
+# Inbotic Web Interface
 
-A beautiful web interface for the Inbotic that allows you to connect your Gmail account and automatically create tasks from your emails.
+Web app for connecting Gmail and creating Google Tasks from email content.
 
-## 🚀 Features
+## Features
 
 - **Beautiful Dashboard** - Clean, modern interface built with Tailwind CSS
-- **Gmail OAuth2 Integration** - Secure authentication with your Gmail account
+- **Dual OAuth Modes** - Hosted OAuth (shared app credentials) or manual OAuth setup
 - **Real-time Email Processing** - Process emails and create tasks with one click
 - **Task Management** - View all your tasks organized by lists
 - **Email History** - See processed emails and extracted information
 - **Statistics Dashboard** - Monitor your Inbotic activity
 - **Responsive Design** - Works on desktop and mobile devices
 
-## 🛠️ Setup
+## Setup
 
-### 1. Install Dependencies
+### 1. Install dependencies
 ```bash
 cd inbotic
 python3 -m venv .venv
@@ -23,26 +23,61 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-### 2. Start the Web Interface
+Set a `SECRET_KEY` in `.env`:
+
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(48))"
+```
+
+Then set:
+
+```env
+SECRET_KEY=<paste-generated-value>
+GOOGLE_REDIRECT_URI=http://localhost:8000/auth/callback
+```
+
+### 2. Start the web interface
 ```bash
 python start_web.py
 ```
 
-### 3. Open in Browser
+### 3. Open in browser
 Visit: **http://localhost:8000**
 
-## 🔑 Authentication
+## Authentication
 
-1. **First Time Setup**:
-   - Click "Connect Gmail" on the homepage
-   - Complete OAuth2 authentication in your browser
-   - Grant permissions for Gmail (read-only) and Google Tasks
+### Mode A: Hosted OAuth (recommended)
 
-2. **Subsequent Uses**:
-   - The authentication token is saved automatically
-   - You'll stay logged in between sessions
+- You (app owner) set `CLIENT_ID` and `CLIENT_SECRET` on the backend.
+- Users click **Continue with Google** and finish login.
+- Best for non-technical end users.
 
-## 📋 Usage
+### Mode B: Manual OAuth
+
+- Users click **Manual OAuth setup**.
+- They can either:
+  - Upload Google OAuth JSON, or
+  - Paste `CLIENT_ID` and `CLIENT_SECRET` directly.
+- Uploaded JSON is saved to `.secrets/google-credentials.json`.
+
+### Production default
+
+- Manual OAuth is disabled by default on hosted/prod environments.
+- To enable it explicitly, set:
+
+```env
+INBOTIC_ALLOW_MANUAL_OAUTH=true
+```
+
+## Google OAuth Checklist
+
+1. Create/select a Google Cloud project.
+2. Enable Gmail API and Google Tasks API.
+3. Configure OAuth consent screen.
+4. Create OAuth Client ID (Web application).
+5. Add redirect URI: `http://localhost:8000/auth/callback` (and your deployed callback URL if hosting).
+
+## Usage
 
 ### Dashboard
 - View statistics and recent activity
@@ -69,7 +104,7 @@ Visit: **http://localhost:8000**
 - View system status and health
 - Quick access to all features
 
-## 🎨 Interface Features
+## Interface Features
 
 - **Modern Design** - Clean, professional interface
 - **Responsive Layout** - Works on all screen sizes
@@ -77,9 +112,9 @@ Visit: **http://localhost:8000**
 - **Intuitive Navigation** - Easy to find what you need
 - **Status Indicators** - Clear visual feedback
 
-## 🔧 Configuration
+## Configuration
 
-The web interface uses the same configuration as the command-line version:
+The web interface uses the same config as the backend:
 
 ```env
 # Google API Configuration
@@ -97,26 +132,29 @@ WEB_PORT=8000
 WEB_URL=http://localhost:8000
 ```
 
-## 🚀 API Endpoints
+## API Endpoints
 
 The web interface provides these endpoints:
 
 - `GET /` - Dashboard/Home page
-- `GET /auth/gmail` - Initiate OAuth2 authentication
+- `GET /auth/gmail` - OAuth entry (auto-chooser when applicable)
+- `GET /auth/gmail?mode=shared` - Force hosted OAuth
+- `GET /auth/gmail?mode=manual` - Force manual setup
+- `GET /setup/google-credentials` - Manual OAuth setup page
 - `GET /auth/callback` - OAuth2 callback handler
 - `POST /process-emails` - Manually trigger email processing
 - `GET /tasks` - View all tasks
 - `GET /emails` - View processed emails
 - `GET /stats` - View statistics
 
-## 🛡️ Security
+## Security
 
 - **OAuth2 Authentication** - Secure Google account connection
 - **Token-based Sessions** - Automatic session management
 - **HTTPS Ready** - Can be deployed with SSL certificates
 - **CORS Protection** - Configurable cross-origin policies
 
-## 🎯 What It Does
+## What It Does
 
 1. **Connect Gmail** - Secure OAuth2 authentication
 2. **Scan Emails** - Find important emails with deadlines and action items
@@ -125,7 +163,7 @@ The web interface provides these endpoints:
 5. **Set Deadlines** - Automatically set due dates when found
 6. **Organize** - Keep everything organized in task lists
 
-## 📱 Mobile Friendly
+## Mobile Friendly
 
 The interface is fully responsive and works great on:
 - Desktop computers
@@ -133,7 +171,7 @@ The interface is fully responsive and works great on:
 - Mobile phones
 - Any modern web browser
 
-## 🔄 Integration
+## Integration
 
 The web interface seamlessly integrates with:
 - **Gmail API** - Read emails securely
@@ -141,16 +179,22 @@ The web interface seamlessly integrates with:
 - **OAuth2 Flow** - Secure authentication
 - **Local Processing** - All processing happens locally
 
-## 🆘 Troubleshooting
+## Troubleshooting
 
 ### "Not Authenticated" Error
 - Make sure you've completed the OAuth2 setup
 - Check that your OAuth token file exists in the project directory
 - Try refreshing the page or re-authenticating
 
+### "OAuth not configured"
+- Hosted mode: set backend `CLIENT_ID` and `CLIENT_SECRET`
+- Manual mode disabled: set `INBOTIC_ALLOW_MANUAL_OAUTH=true`
+- Then restart backend
+
 ### "Configuration error: Missing CLIENT_ID/CLIENT_SECRET"
-- Set `CLIENT_ID` and `CLIENT_SECRET` in `.env`
-- Restart the server after changing `.env`
+- Use manual setup page (`/setup/google-credentials`) and upload JSON/paste values, or
+- Set `CLIENT_ID`/`CLIENT_SECRET` in backend env
+- Restart backend
 
 ### "Missing required environment variable: SECRET_KEY"
 - Set `SECRET_KEY` in `.env`
@@ -166,19 +210,19 @@ The web interface seamlessly integrates with:
 - Check the terminal for error messages
 - Verify all dependencies are installed
 
-## 🚀 Production Deployment
+## Production Deployment
 
 For production use:
 
-1. **Set up a reverse proxy** (nginx recommended)
-2. **Configure HTTPS** with SSL certificates
-3. **Set up a process manager** (systemd, supervisor, etc.)
-4. **Configure environment variables** for production URLs
+1. Host FastAPI backend on a backend platform (Render, Railway, Fly.io, VPS, container host).
+2. Host React frontend on Vercel/Netlify if desired.
+3. Set backend env vars: `CLIENT_ID`, `CLIENT_SECRET`, `GOOGLE_REDIRECT_URI`, `SECRET_KEY`.
+4. Add deployed callback URL in Google OAuth redirect URIs.
 
-## 📞 Support
+## Support
 
 The web interface provides the same functionality as the command-line version but with a user-friendly interface. All the core email processing and task creation logic remains the same.
 
 ---
 
-**🎉 Enjoy your new Inbotic web interface!**
+Inbotic web interface is ready for both beginner local setup and production hosted OAuth.

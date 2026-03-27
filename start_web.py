@@ -1,10 +1,15 @@
 import os
 import sys
 import subprocess
+import secrets
 from pathlib import Path
+
+from dotenv import load_dotenv
 
 def main():
     """Start the Inbotic web interface"""
+    load_dotenv()
+
     print("🚀 Starting Inbotic Web Interface")
     print("=" * 50)
 
@@ -37,6 +42,15 @@ def main():
         print("1. Visit: http://localhost:8000")
         print("2. Click 'Connect Gmail'")
         print("3. Complete OAuth2 authentication")
+
+    # Keep local development usable even if .env is missing.
+    if not os.getenv("SECRET_KEY", "").strip():
+        temp_secret = secrets.token_urlsafe(48)
+        os.environ["SECRET_KEY"] = temp_secret
+        os.environ.setdefault("DECODER_SECRET_KEY", temp_secret)
+        print("⚠️  SECRET_KEY not found in environment")
+        print("Using a temporary in-memory key for this session only.")
+        print("Set SECRET_KEY in .env for persistent logins and production use.")
 
     # Start the web server
     print("🌐 Starting web server at http://localhost:8000")

@@ -7,6 +7,7 @@ import base64
 from email.mime.text import MIMEText
 import logging
 from sqlalchemy.orm import Session
+from google_oauth_config import resolve_google_oauth_client_config
 
 logger = logging.getLogger(__name__)
 
@@ -18,12 +19,13 @@ class GmailService:
     @classmethod
     def from_user_token(cls, token_data: dict):
         """Create GmailService from user token data"""
+        client_id, client_secret = resolve_google_oauth_client_config()
         credentials = Credentials(
             token=token_data.get('access_token'),
             refresh_token=token_data.get('refresh_token'),
             token_uri="https://oauth2.googleapis.com/token",
-            client_id=os.getenv("CLIENT_ID"),
-            client_secret=os.getenv("CLIENT_SECRET")
+            client_id=client_id,
+            client_secret=client_secret
         )
         if credentials.expired and credentials.refresh_token:
             try:
