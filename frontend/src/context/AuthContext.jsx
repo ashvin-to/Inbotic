@@ -50,7 +50,7 @@ export const AuthProvider = ({ children }) => {
     const logout = async () => {
         try {
             // Hit backend HTML logout endpoint to clear session cookie
-            await fetch('http://localhost:8000/logout', { method: 'GET', credentials: 'include' });
+            await fetch(`${import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'}/logout`, { method: 'GET', credentials: 'include' });
         } catch (error) {
             console.error("Logout failed", error);
         } finally {

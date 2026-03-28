@@ -42,7 +42,12 @@ const Navbar = () => {
                                 </button>
                             </>
                         ) : (
-                            <a href="http://localhost:8000/auth/gmail" className="px-4 py-2 rounded-full text-sm font-semibold bg-emerald-600 text-white hover:bg-emerald-500 transition-colors">Login with Gmail</a>
+                            <a
+                                href={`${import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'}/auth/gmail`}
+                                className="px-4 py-2 rounded-full text-sm font-semibold bg-emerald-600 text-white hover:bg-emerald-500 transition-colors"
+                            >
+                                Login with Gmail
+                            </a>
                         )}
                     </div>
                 </div>

@@ -36,7 +36,7 @@ const Profile = () => {
                 const img = new Image();
                 const photoUrl = userData.profile_photo.startsWith('http')
                     ? userData.profile_photo
-                    : `http://localhost:8000${userData.profile_photo}`;
+                    : `${import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'}${userData.profile_photo}`;
                 img.src = photoUrl;
             }
 
@@ -86,7 +86,7 @@ const Profile = () => {
 
             // Use the full_photo_url if available, otherwise construct it
             const photoUrl = response.data.full_photo_url ||
-                `http://localhost:8000${response.data.profile_photo}?t=${Date.now()}`;
+                `${import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'}${response.data.profile_photo}?t=${Date.now()}`;
 
             // Update both profile state and local storage
             const updatedProfile = {
@@ -216,7 +216,7 @@ const Profile = () => {
                             {profile.profile_photo ? (
                                 <img
                                     className="h-32 w-32 rounded-full object-cover mx-auto ring-4 ring-white dark:ring-gray-700 shadow-lg"
-                                    src={profile.full_photo_url || (profile.profile_photo.startsWith('http') ? profile.profile_photo : `http://localhost:8000${profile.profile_photo}?t=${Date.now()}`)}
+                                    src={profile.full_photo_url || (profile.profile_photo.startsWith('http') ? profile.profile_photo : `${import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'}${profile.profile_photo}?t=${Date.now()}`)}
                                     alt={profile.username}
                                     onError={(e) => {
                                         // If image fails to load, fallback to default avatar
@@ -369,7 +369,7 @@ const Profile = () => {
                                     Active
                                 </span>
                             ) : (
-                                <a href="http://localhost:8000/auth/gmail" className="inline-flex items-center px-3 py-1.5 border border-transparent text-xs font-medium rounded text-indigo-700 bg-indigo-100 hover:bg-indigo-200 dark:bg-indigo-900/30 dark:text-indigo-300 dark:hover:bg-indigo-900/50 transition-colors">
+                                <a href={`${import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'}/auth/gmail`} className="inline-flex items-center px-3 py-1.5 border border-transparent text-xs font-medium rounded text-indigo-700 bg-indigo-100 hover:bg-indigo-200 dark:bg-indigo-900/30 dark:text-indigo-300 dark:hover:bg-indigo-900/50 transition-colors">
                                     Connect
                                 </a>
                             )}

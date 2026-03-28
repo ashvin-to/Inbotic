@@ -77,7 +77,10 @@ const Home = () => {
                         Connect Gmail once and let Inbotic extract real deadlines into Google Tasks.
                     </p>
                     <div className="mt-8 flex flex-wrap items-center justify-center gap-4">
-                        <a href="http://localhost:8000/auth/gmail" className="btn-primary">
+                        <a
+                            href={`${import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'}/auth/gmail`}
+                            className="btn-primary"
+                        >
                             Connect Gmail
                         </a>
                     </div>
