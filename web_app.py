@@ -94,6 +94,7 @@ app.add_middleware(
 )
 
 # Mount static files
+os.makedirs("static", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # Initialize database
