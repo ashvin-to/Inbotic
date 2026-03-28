@@ -156,6 +156,9 @@ When backend is running, FastAPI docs are available at:
 
 - **Missing `SECRET_KEY` error:** set `SECRET_KEY` in `.env` (required at startup).
 - **OAuth callback errors:** verify `GOOGLE_REDIRECT_URI` exactly matches Google Cloud settings.
+- **After Google login, browser says unable to connect:**
+   - If using backend UI only, unset `FRONTEND_URL` so callback returns to `http://localhost:8000/`.
+   - If using React UI, ensure frontend dev server is running at `FRONTEND_URL` (default `http://localhost:5173`).
 - **Gmail/Tasks auth failures:** ensure APIs are enabled in your Google Cloud project.
 - **Module import issues:** confirm `.venv` is activated and dependencies installed.
 

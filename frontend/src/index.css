@@ -1,18 +1,174 @@
 @import "tailwindcss";
+@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;700&display=swap');
 
 
 @custom-variant dark (&:where(.dark, .dark *));
 
 @theme {
-  --font-sans: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
+  --font-sans: Manrope, "Space Grotesk", "Segoe UI", sans-serif;
 }
 
-/* Global styles */
+:root {
+  --page-bg: #f5f7f2;
+  --page-fg: #19221b;
+  --panel: rgba(255, 255, 255, 0.75);
+  --panel-border: rgba(25, 34, 27, 0.08);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 4px 6px rgba(0, 0, 0, 0.08), 0 2px 4px rgba(0, 0, 0, 0.04);
+  --shadow-lg: 0 10px 15px rgba(0, 0, 0, 0.08), 0 4px 6px rgba(0, 0, 0, 0.04);
+}
+
+html, body, #root {
+  min-height: 100%;
+}
+
 body {
-  @apply bg-gray-50 text-gray-900 transition-colors duration-300;
+  color: var(--page-fg);
+  background:
+    radial-gradient(1200px 600px at 0% -15%, rgba(255, 157, 66, 0.24), transparent 55%),
+    radial-gradient(1100px 640px at 100% -10%, rgba(73, 192, 157, 0.2), transparent 58%),
+    linear-gradient(180deg, #f8faf6 0%, #edf3eb 55%, #e8f0e9 100%);
+  transition: background-color 250ms ease, color 250ms ease;
 }
 
-/* Dark mode overrides using the variant */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background-image: linear-gradient(rgba(18, 30, 24, 0.03) 1px, transparent 1px), linear-gradient(90deg, rgba(18, 30, 24, 0.03) 1px, transparent 1px);
+  background-size: 28px 28px;
+  mask-image: radial-gradient(circle at center, rgba(0, 0, 0, 0.8), transparent 75%);
+}
+
+.dark {
+  --page-bg: #101913;
+  --page-fg: #e9f2eb;
+  --panel: rgba(18, 30, 24, 0.75);
+  --panel-border: rgba(233, 242, 235, 0.12);
+}
+
 .dark body {
-  @apply bg-gray-900 text-gray-100;
+  color: var(--page-fg);
+  background:
+    radial-gradient(900px 520px at 4% -8%, rgba(241, 130, 50, 0.18), transparent 55%),
+    radial-gradient(900px 520px at 96% -16%, rgba(25, 184, 128, 0.16), transparent 55%),
+    linear-gradient(180deg, #101913 0%, #0f1612 45%, #111e17 100%);
+}
+
+.glass-panel {
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  box-shadow: var(--shadow-md);
+  transition: all 200ms ease;
+}
+
+.glass-panel:hover {
+  border-color: rgba(25, 34, 27, 0.15);
+  box-shadow: var(--shadow-lg);
+  transforms: translateY(-1px);
+}
+
+.dark .glass-panel:hover {
+  border-color: rgba(233, 242, 235, 0.18);
+}
+
+.display-title {
+  font-family: "Space Grotesk", Manrope, sans-serif;
+  letter-spacing: -0.02em;
+}
+
+/* Enhanced button styling */
+@layer components {
+  .btn-primary {
+    @apply inline-flex items-center justify-center rounded-full font-semibold text-sm px-6 py-3 transition-all duration-200;
+    background: linear-gradient(135deg, #059669 0%, #10b981 100%);
+    color: white;
+    box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3);
+  }
+
+  .btn-primary:hover {
+    @apply -translate-y-0.5;
+    box-shadow: 0 6px 20px rgba(16, 185, 129, 0.4);
+  }
+
+  .btn-primary:active {
+    @apply translate-y-0;
+    box-shadow: 0 2px 8px rgba(16, 185, 129, 0.3);
+  }
+
+  .btn-primary:disabled {
+    @apply opacity-60 cursor-not-allowed;
+  }
+
+  .btn-secondary {
+    @apply inline-flex items-center justify-center rounded-full font-semibold text-sm px-6 py-3 transition-all duration-200;
+    background: rgba(0, 0, 0, 0.05);
+    color: inherit;
+    border: 1px solid rgba(0, 0, 0, 0.15);
+  }
+
+  .dark .btn-secondary {
+    @apply bg-white/5 border-white/15;
+  }
+
+  .btn-secondary:hover {
+    @apply -translate-y-0.5 bg-black/8;
+    box-shadow: var(--shadow-md);
+  }
+
+  .dark .btn-secondary:hover {
+    @apply bg-white/8;
+  }
+
+  .btn-secondary:active {
+    @apply translate-y-0;
+  }
+
+  /* Form inputs */
+  .form-input {
+    @apply w-full px-4 py-3 rounded-xl border transition-all duration-200;
+    background: rgba(255, 255, 255, 0.6);
+    border-color: rgba(0, 0, 0, 0.12);
+  }
+
+  .dark .form-input {
+    @apply bg-white/8 border-white/15;
+  }
+
+  .form-input:focus {
+    @apply outline-none border-emerald-500 ring-2 ring-emerald-500/10;
+    border-color: #10b981;
+  }
+
+  .form-input::placeholder {
+    @apply text-gray-500 dark:text-gray-400;
+  }
+
+  /* Alert boxes */
+  .alert-success {
+    @apply rounded-xl p-4 bg-emerald-50 border border-emerald-200 text-emerald-800;
+  }
+
+  .dark .alert-success {
+    @apply bg-emerald-900/20 border-emerald-700 text-emerald-200;
+  }
+
+  .alert-error {
+    @apply rounded-xl p-4 bg-rose-50 border border-rose-200 text-rose-800;
+  }
+
+  .dark .alert-error {
+    @apply bg-rose-900/20 border-rose-700 text-rose-200;
+  }
+
+  .alert-warning {
+    @apply rounded-xl p-4 bg-amber-50 border border-amber-200 text-amber-800;
+  }
+
+  .dark .alert-warning {
+    @apply bg-amber-900/20 border-amber-700 text-amber-200;
+  }
 }

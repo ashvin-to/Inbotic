@@ -82,6 +82,7 @@ class Task(Base):
     title = Column(String, nullable=False)
     description = Column(Text, nullable=True)
     due_date = Column(DateTime, nullable=True)
+    due_time = Column(String, nullable=True)  # HH:MM:SS format extracted from email
     status = Column(String, default="pending")  # pending, completed
     priority = Column(String, default="medium")  # high, medium, low
     created_at = Column(DateTime, default=datetime.utcnow)

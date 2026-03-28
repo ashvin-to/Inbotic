@@ -4,6 +4,26 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 
+_PLACEHOLDER_VALUES = {
+    "your-google-oauth-client-id",
+    "your-google-oauth-client-secret",
+    "your_client_id",
+    "your_client_secret",
+    "changeme",
+    "replace-me",
+    "replace_with_your_value",
+}
+
+
+def _normalize_env_value(value: Optional[str]) -> Optional[str]:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    if raw.lower() in _PLACEHOLDER_VALUES:
+        return None
+    return raw
+
+
 def _extract_client_fields(payload: dict) -> Tuple[Optional[str], Optional[str]]:
     """Extract OAuth client_id/client_secret from Google credentials JSON."""
     for section in ("web", "installed"):
@@ -41,8 +61,8 @@ def resolve_google_oauth_client_config() -> Tuple[Optional[str], Optional[str]]:
     3) File path from GOOGLE_CREDENTIALS_PATH (default .secrets/google-credentials.json)
     4) Auto-detect common credential file names in project root/.secrets
     """
-    client_id = (os.getenv("CLIENT_ID") or "").strip() or None
-    client_secret = (os.getenv("CLIENT_SECRET") or "").strip() or None
+    client_id = _normalize_env_value(os.getenv("CLIENT_ID"))
+    client_secret = _normalize_env_value(os.getenv("CLIENT_SECRET"))
     if client_id and client_secret:
         return client_id, client_secret
 
@@ -78,9 +98,11 @@ def resolve_google_oauth_client_config() -> Tuple[Optional[str], Optional[str]]:
         if client_id and client_secret:
             break
 
-    if client_id:
-        os.environ.setdefault("CLIENT_ID", client_id)
-    if client_secret:
-        os.environ.setdefault("CLIENT_SECRET", client_secret)
+    current_id = _normalize_env_value(os.getenv("CLIENT_ID"))
+    current_secret = _normalize_env_value(os.getenv("CLIENT_SECRET"))
+    if client_id and not current_id:
+        os.environ["CLIENT_ID"] = client_id
+    if client_secret and not current_secret:
+        os.environ["CLIENT_SECRET"] = client_secret
 
     return client_id, client_secret

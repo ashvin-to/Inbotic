@@ -1,9 +1,11 @@
 import os
+import re
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 import logging
+from google_oauth_config import resolve_google_oauth_client_config
 
 logger = logging.getLogger(__name__)
 
@@ -15,12 +17,13 @@ class GoogleTasksService:
     @classmethod
     def from_user_token(cls, token_data: dict):
         """Create GoogleTasksService from user token data"""
+        client_id, client_secret = resolve_google_oauth_client_config()
         credentials = Credentials(
             token=token_data.get('access_token'),
             refresh_token=token_data.get('refresh_token'),
             token_uri="https://oauth2.googleapis.com/token",
-            client_id=os.getenv("CLIENT_ID"),
-            client_secret=os.getenv("CLIENT_SECRET")
+            client_id=client_id,
+            client_secret=client_secret
         )
         if credentials.expired and credentials.refresh_token:
             try:
@@ -120,6 +123,7 @@ class GoogleTasksService:
                               default_due_time_utc: str = "09:00:00.000Z",
                               create_action_tasks: bool = False,
                               pre_reminder_days: int = 1,
+                              pre_reminder_hours: int = 0,
                               create_pre_reminder: bool = True,
                               dedupe: bool = True) -> List[Dict[str, Any]]:
         """
@@ -129,6 +133,7 @@ class GoogleTasksService:
             task_list_id: ID of the task list
             email_data: Email data dictionary
             extract_deadlines: Whether to extract deadlines from email
+            pre_reminder_hours: Create a reminder N hours before deadline (e.g., 1 for 1-hour prior)
 
         Returns:
             List of created tasks
@@ -150,6 +155,29 @@ class GoogleTasksService:
                 return created_tasks
 
             due_date = deadline_info['due_date']
+            due_time_raw = deadline_info.get('due_time') or default_due_time_utc
+
+            def _normalize_time_hms(time_value: str, fallback: str = "09:00:00") -> str:
+                """Normalize time values like HH:MM, HH:MM:SS, HH:MM:SS.000Z to HH:MM:SS."""
+                if not time_value:
+                    return fallback
+                text = str(time_value).strip()
+                if 'T' in text:
+                    text = text.split('T', 1)[1]
+                text = text.replace('Z', '')
+                text = text.split('.', 1)[0]
+                # Remove timezone offsets if present.
+                text = re.sub(r'([+-]\d{2}:?\d{2})$', '', text).strip()
+                parts = text.split(':')
+                if len(parts) == 2:
+                    text = f"{parts[0]}:{parts[1]}:00"
+                m = re.fullmatch(r'([01]?\d|2[0-3]):([0-5]\d):([0-5]\d)', text)
+                if not m:
+                    return fallback
+                return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}:{int(m.group(3)):02d}"
+
+            due_time_hms = _normalize_time_hms(due_time_raw, "09:00:00")
+            due_time_utc = f"{due_time_hms}.000Z"
 
             # Ensure deadline is today or future
             try:
@@ -168,43 +196,81 @@ class GoogleTasksService:
                 logger.info("Unable to parse due date; skipping task creation")
                 return created_tasks
 
-            # Optionally dedupe by email id marker
+            # Keep marker for traceability in notes; dedupe is title-based.
             email_id = email_data.get('id') or email_data.get('gmail_message_id')
             marker = f"[IA:{email_id}]" if email_id else None
 
-            if dedupe and marker:
+            # Create concise task title/notes focused on what the task is about.
+            import re as _re
+            import html as _html
+
+            def _clean_text(raw: str) -> str:
+                if not raw:
+                    return ""
+                text = _html.unescape(raw)
+                text = _re.sub(r'<(script|style)[^>]*>.*?</\1>', ' ', text, flags=_re.IGNORECASE | _re.DOTALL)
+                text = _re.sub(r'<[^>]+>', ' ', text)
+                text = _re.sub(r'\s+', ' ', text).strip()
+                return text
+
+            def _short_summary(raw: str, max_len: int = 180) -> str:
+                cleaned = _clean_text(raw)
+                if not cleaned:
+                    return ""
+                sentence = _re.split(r'(?<=[.!?])\s+', cleaned)[0].strip()
+                if len(sentence) >= 20:
+                    cleaned = sentence
+                return cleaned[:max_len].rstrip()
+
+            raw_subject = (email_data.get('subject') or 'Task').strip()
+            clean_subject = _clean_text(raw_subject)
+            clean_subject = _re.sub(r'^(?:re|fw|fwd)\s*:\s*', '', clean_subject, flags=_re.IGNORECASE).strip()
+            main_task_title = clean_subject[:90] if clean_subject else 'Task from email'
+            if len(clean_subject) > 90:
+                main_task_title += '...'
+
+            def _normalize_title(text: str) -> str:
+                return _re.sub(r'\s+', ' ', (text or '').strip()).lower()
+
+            existing_title_keys = set()
+            if dedupe:
                 try:
-                    existing_tasks = self.get_tasks(task_list_id, max_results=100)
-                    for t in existing_tasks:
-                        notes = t.get('notes', '') or ''
-                        title = t.get('title', '') or ''
-                        if marker in notes or marker in title:
-                            logger.info("Task(s) for this email already exist; skipping due to dedupe marker")
-                            # Return a marker to indicate dedupe, not failure
-                            return [{"dedupe": True, "message": "Task already exists"}]
+                    existing_tasks = self.get_tasks(
+                        task_list_id=task_list_id,
+                        max_results=300,
+                        show_completed=True,
+                        show_hidden=False,
+                    )
+                    existing_title_keys = {
+                        _normalize_title(t.get('title', ''))
+                        for t in existing_tasks
+                        if t.get('title')
+                    }
                 except Exception:
-                    # If fetching tasks fails, proceed without dedupe
-                    pass
+                    # If fetching tasks fails, proceed without dedupe.
+                    existing_title_keys = set()
 
-            # Create main task for the email
-            main_task_title = f"Process: {email_data['subject'][:50]}"
-            if len(email_data['subject']) > 50:
-                main_task_title += "..."
+            if dedupe and _normalize_title(main_task_title) in existing_title_keys:
+                logger.info("Task with same title already exists; skipping create")
+                return [{"dedupe": True, "message": "Task with same title already exists"}]
 
-            # Build clean notes with context and Gmail link
-            thread_id = email_data.get('thread_id')
+            thread_id = email_data.get('thread_id') or email_data.get('id')
             gmail_link = f"https://mail.google.com/mail/u/0/#all/{thread_id}" if thread_id else None
-            lines = []
-            lines.append(f"From: {email_data['sender']}")
+
+            about = _short_summary(email_data.get('body') or '')
+            if not about:
+                about = clean_subject
+
+            lines = [f"About: {about}"]
+            if email_data.get('sender'):
+                lines.append(f"From: {email_data['sender']}")
+            # Add the extracted time prominently
+            if due_time_hms:
+                lines.append(f"⏰ Time: {due_time_hms[:5]} UTC")  # Show HH:MM format
             if gmail_link:
                 lines.append(f"Link: {gmail_link}")
             if marker:
                 lines.append(marker)
-            # Add a short preview of body
-            preview = (email_data['body'] or '')[:500]
-            if preview:
-                lines.append("")
-                lines.append(preview + ("..." if len(email_data['body']) > 500 else ""))
             main_notes = "\n".join(lines)
 
             main_task = self.create_task(
@@ -212,28 +278,64 @@ class GoogleTasksService:
                 title=main_task_title,
                 notes=main_notes,
                 due_date=due_date,
-                default_due_time_utc=default_due_time_utc
+                default_due_time_utc=due_time_utc
             )
             if main_task:
                 created_tasks.append(main_task)
+                if dedupe:
+                    existing_title_keys.add(_normalize_title(main_task_title))
 
             # Optionally create a pre-deadline reminder task (clean, simple reminder)
-            if create_pre_reminder and pre_reminder_days > 0:
+            if create_pre_reminder:
                 try:
                     from datetime import datetime as _dt, timedelta as _td
-                    pre_due = (email_due - _td(days=pre_reminder_days)).strftime('%Y-%m-%d')
-                    # Only if still in the future (or today)
-                    if _dt.strptime(pre_due, '%Y-%m-%d').date() >= _dt.now().date():
-                        reminder_title = f"Reminder: {email_data['subject'][:60]}" + ("..." if len(email_data['subject']) > 60 else "")
-                        reminder = self.create_task(
-                            task_list_id=task_list_id,
-                            title=reminder_title,
-                            notes=(f"Due soon → {due_date}\nFrom: {email_data['sender']}" + (f"\nLink: {gmail_link}" if gmail_link else "") + (f"\n{marker}" if marker else "")),
-                            due_date=pre_due,
-                            default_due_time_utc=default_due_time_utc
-                        )
-                        if reminder:
-                            created_tasks.append(reminder)
+                    
+                    # Support both day-based and hour-based pre-reminders
+                    if pre_reminder_hours > 0 and due_time_hms:
+                        # Hour-based reminder: subtract N hours from the deadline time
+                        try:
+                            # Parse the deadline: due_date (YYYY-MM-DD) and due_time (HH:MM:SS)
+                            deadline_dt = _dt.strptime(f"{due_date} {due_time_hms}", "%Y-%m-%d %H:%M:%S")
+                            reminder_dt = deadline_dt - _td(hours=pre_reminder_hours)
+                            pre_due_date = reminder_dt.strftime('%Y-%m-%d')
+                            pre_due_time = reminder_dt.strftime('%H:%M:%S')
+                            
+                            # Only create if still in the future
+                            if reminder_dt > _dt.now():
+                                reminder_title = f"⏰ {pre_reminder_hours}h reminder: {email_data['subject'][:50]}" + ("..." if len(email_data['subject']) > 50 else "")
+                                if (not dedupe) or (_normalize_title(reminder_title) not in existing_title_keys):
+                                    reminder = self.create_task(
+                                        task_list_id=task_list_id,
+                                        title=reminder_title,
+                                        notes=(f"Due in {pre_reminder_hours} hour(s) →  {due_date} {due_time_hms}\nFrom: {email_data['sender']}" + (f"\nLink: {gmail_link}" if gmail_link else "") + (f"\n{marker}" if marker else "")),
+                                        due_date=pre_due_date,
+                                        default_due_time_utc=f"{pre_due_time}.000Z"
+                                    )
+                                    if reminder:
+                                        created_tasks.append(reminder)
+                                        if dedupe:
+                                            existing_title_keys.add(_normalize_title(reminder_title))
+                        except Exception as e:
+                            logger.debug(f"Failed to create hour-based reminder: {e}")
+                    
+                    elif pre_reminder_days > 0:
+                        # Day-based reminder: subtract N days from the deadline
+                        pre_due = (email_due - _td(days=pre_reminder_days)).strftime('%Y-%m-%d')
+                        # Only if still in the future (or today)
+                        if _dt.strptime(pre_due, '%Y-%m-%d').date() >= _dt.now().date():
+                            reminder_title = f"Reminder: {email_data['subject'][:60]}" + ("..." if len(email_data['subject']) > 60 else "")
+                            if (not dedupe) or (_normalize_title(reminder_title) not in existing_title_keys):
+                                reminder = self.create_task(
+                                    task_list_id=task_list_id,
+                                    title=reminder_title,
+                                    notes=(f"Due soon → {due_date} {due_time_hms}" + f"\nFrom: {email_data['sender']}" + (f"\nLink: {gmail_link}" if gmail_link else "") + (f"\n{marker}" if marker else "")),
+                                    due_date=pre_due,
+                                    default_due_time_utc=due_time_utc
+                                )
+                                if reminder:
+                                    created_tasks.append(reminder)
+                                    if dedupe:
+                                        existing_title_keys.add(_normalize_title(reminder_title))
                 except Exception as _:
                     pass
 
@@ -241,15 +343,20 @@ class GoogleTasksService:
             if create_action_tasks:
                 action_tasks = self._extract_action_tasks(email_data)
                 for action_task in action_tasks:
+                    action_title = action_task.get('title', '')
+                    if dedupe and _normalize_title(action_title) in existing_title_keys:
+                        continue
                     task = self.create_task(
                         task_list_id=task_list_id,
-                        title=action_task['title'],
+                        title=action_title,
                         notes=action_task['notes'],
                         due_date=due_date,
-                        default_due_time_utc=default_due_time_utc
+                        default_due_time_utc=due_time_utc
                     )
                     if task:
                         created_tasks.append(task)
+                        if dedupe:
+                            existing_title_keys.add(_normalize_title(action_title))
 
             logger.info(f"Created {len(created_tasks)} deadline-based tasks from email")
             return created_tasks
@@ -260,182 +367,286 @@ class GoogleTasksService:
 
     def _extract_deadline_info(self, email_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
-        Extract deadline information from email with enhanced pattern matching
-        and context awareness.
+        Extract deadline information from email using a staged deterministic parser:
+        1) keyword-adjacent windows, 2) subject-focused scan, 3) full-text fallback.
+        Also extracts time if present in the deadline text, and searches for times separately.
 
         Args:
             email_data: Email data dictionary containing 'subject' and 'body' keys
 
         Returns:
-            Dictionary with 'due_date' (YYYY-MM-DD) and 'description' of the deadline,
-            or None if no valid deadline found
+            Dictionary with 'due_date' (YYYY-MM-DD), 'due_time' (HH:MM:SS format if found),
+            and 'description' of the deadline, or None if no valid deadline found
         """
         import re
         from datetime import datetime, timedelta
         from dateutil.parser import parse as parse_date
 
-        def extract_dates(text):
-            """Helper to extract dates from text using multiple patterns"""
-            patterns = [
-                # DD/MM/YYYY or DD-MM-YYYY (common in India/Europe)
-                r'\b(\d{1,2}[-/]\d{1,2}[-/](?:20)?\d{2})\b',
-                # ISO dates (YYYY-MM-DD, YYYY/MM/DD)
-                r'\b(20\d{2}[-/]\d{1,2}[-/]\d{1,2})\b',
-                # Month DD, YYYY
-                r'\b((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[\s,]+\d{1,2}(?:st|nd|rd|th)?[,\s]*\d{4})\b',
-                # DD Month YYYY
-                r'\b(\d{1,2}(?:st|nd|rd|th)?[\s,]+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[\s,]*\d{4})\b',
-                # Full month names
-                r'\b((?:January|February|March|April|May|June|July|August|September|October|November|December)[\s,]+\d{1,2}(?:st|nd|rd|th)?[,\s]*\d{4})\b',
-                # DD Month (without year)
-                r'\b(\d{1,2}(?:st|nd|rd|th)?[\s]+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*)\b',
-            ]
-            
-            dates = []
-            for pattern in patterns:
-                matches = re.findall(pattern, text, re.IGNORECASE)
-                dates.extend(matches)
-            return dates
+        # Time pattern that can extract time from anywhere in the email
+        # Time pattern that can extract time from anywhere in the email
+        # Time pattern that can extract time from anywhere in the email
+        TIME_EXTRACTION_PATTERN = re.compile(
+            r'\b(\d{1,2})\s*(?::(\d{2}))?\s*(am|pm)\b|'
+            r'\b([01]\d|2[0-3]):([0-5]\d)\s*(?:utc|gmt|ist)?\b',
+            re.IGNORECASE
+        )
 
-        def parse_relative_date(date_str, email_datetime=None):
-            """Parse relative date strings like 'tomorrow', 'next week', etc."""
-            now = email_datetime or datetime.now()
-            date_str = date_str.lower().strip()
-            
-            if date_str == 'today':
-                return now.date()
-            elif date_str == 'tomorrow':
-                return (now + timedelta(days=1)).date()
-            elif date_str == 'next week':
-                return (now + timedelta(weeks=1)).date()
-            elif date_str == 'next month':
-                return (now + timedelta(days=30)).date()
-            elif date_str.startswith('in ') and 'day' in date_str:
-                try:
-                    days = int(re.search(r'\d+', date_str).group())
-                    return (now + timedelta(days=days)).date()
-                except:
-                    return None
-            return None
+        ABSOLUTE_PATTERNS = [
+            re.compile(r'\b20\d{2}[\-\/.](?:0?[1-9]|1[0-2])[\-\/.](?:0?[1-9]|[12]\d|3[01])\b', re.IGNORECASE),
+            re.compile(r'\b(?:0?[1-9]|[12]\d|3[01])[\-\/.](?:0?[1-9]|1[0-2])[\-\/.](?:\d{2}|\d{4})\b', re.IGNORECASE),
+            re.compile(r'\b(?:0?[1-9]|1[0-2])[\-\/.](?:0?[1-9]|[12]\d|3[01])[\-\/.](?:\d{2}|\d{4})\b', re.IGNORECASE),
+            re.compile(r'\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)[\s,]+\d{1,2}(?:st|nd|rd|th)?(?:[\s,]+\d{4})?(?:[\s,]+(\d{1,2}):(\d{2})(?:\s*(?:am|pm))?)?(?:\s*\(?(?:utc|gmt|ist)\)?)?\b', re.IGNORECASE),
+            re.compile(r'\b\d{1,2}(?:st|nd|rd|th)?\s+(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:,?\s*\d{4})?(?:[\s,]+(\d{1,2}):(\d{2})(?:\s*(?:am|pm))?)?(?:\s*\(?(?:utc|gmt|ist)\)?)?\b', re.IGNORECASE),
+            re.compile(r'\b(?:mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?),?\s+(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)[\s,]+\d{1,2}(?:st|nd|rd|th)?(?:[\s,]+\d{4})?(?:[\s,]+(\d{1,2}):(\d{2})(?:\s*(?:am|pm))?)?(?:\s*\(?(?:utc|gmt|ist)\)?)?\b', re.IGNORECASE),
+        ]
 
-        def parse_date_string(date_str):
-            """Try to parse a date string in various formats"""
-            # Handle DD/MM/YY or DD/MM/YYYY format
-            for fmt in ['%d/%m/%y', '%d/%m/%Y', '%d-%m-%y', '%d-%m-%Y', 
-                        '%Y-%m-%d', '%Y/%m/%d', '%m/%d/%Y', '%m-%d-%Y']:
+        RELATIVE_PATTERN = re.compile(
+            r'\b('
+            r'day\s+after\s+tomorrow|tomorrow|tommorow|today|tonight|eod|end\s+of\s+day|'
+            r'next\s+week|next\s+month|'
+            r'next\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)|'
+            r'this\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)|'
+            r'in\s+\d{1,2}\s+(?:day|days|week|weeks|month|months)'
+            r')\b',
+            re.IGNORECASE,
+        )
+
+        KEYWORD_PATTERN = re.compile(
+            r'\b('
+            r'deadline|due(?:\s+date)?|apply\s+by|submit(?:ted)?\s+by|'
+            r'register\s+by|registration\s+closes?|closing\s+date|'
+            r'last\s+date|before|until|no\s+later\s+than|not\s+after|'
+            r'starts?\s+on|begins?\s+on|scheduled\s+for|held\s+on|takes\s+place\s+on|'
+            r'expires?|ends?|assessment|exam|test|quiz|assignment|project|submission|'
+            r'meeting|event|class|workshop|seminar|conference'
+            r')\b',
+            re.IGNORECASE,
+        )
+
+        def _has_explicit_year(text: str) -> bool:
+            return bool(re.search(r'\b(?:19|20)\d{2}\b', text))
+
+        def _normalize_yearless(candidate_date):
+            if candidate_date < base_date.date() - timedelta(days=1):
                 try:
-                    return datetime.strptime(date_str, fmt).date()
+                    return candidate_date.replace(year=candidate_date.year + 1)
                 except ValueError:
-                    continue
-            
-            # Try dateutil parser as fallback
-            try:
-                parsed = parse_date(date_str, dayfirst=True, fuzzy=True)
-                if parsed:
-                    # Handle missing year
-                    if parsed.year == 1900 or parsed.year < 2020:
-                        parsed = parsed.replace(year=datetime.now().year)
-                        if parsed.date() < datetime.now().date():
-                            parsed = parsed.replace(year=datetime.now().year + 1)
-                    return parsed.date()
-            except:
-                pass
+                    return candidate_date + timedelta(days=365)
+            return candidate_date
+
+        def parse_relative_date(date_str: str):
+            text = re.sub(r'\s+', ' ', date_str.lower()).strip()
+            if text in ('today', 'tonight', 'eod', 'end of day'):
+                return base_date.date()
+            if text in ('tomorrow', 'tommorow'):
+                return (base_date + timedelta(days=1)).date()
+            if text == 'day after tomorrow':
+                return (base_date + timedelta(days=2)).date()
+            if text == 'next week':
+                return (base_date + timedelta(weeks=1)).date()
+            if text == 'next month':
+                return (base_date + timedelta(days=30)).date()
+
+            in_delta = re.search(r'in\s+(\d{1,2})\s+(day|days|week|weeks|month|months)', text, re.IGNORECASE)
+            if in_delta:
+                amount = int(in_delta.group(1))
+                unit = in_delta.group(2).lower()
+                if 'day' in unit:
+                    return (base_date + timedelta(days=amount)).date()
+                if 'week' in unit:
+                    return (base_date + timedelta(weeks=amount)).date()
+                return (base_date + timedelta(days=amount * 30)).date()
+
+            weekday_map = {
+                'monday': 0,
+                'tuesday': 1,
+                'wednesday': 2,
+                'thursday': 3,
+                'friday': 4,
+                'saturday': 5,
+                'sunday': 6,
+            }
+            wmatch = re.search(r'\b(this|next)\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b', text)
+            if wmatch:
+                mode, weekday_name = wmatch.group(1).lower(), wmatch.group(2).lower()
+                target = weekday_map[weekday_name]
+                now_wd = base_date.weekday()
+                delta = (target - now_wd) % 7
+                if mode == 'next':
+                    delta = delta + 7 if delta == 0 else delta
+                return (base_date + timedelta(days=delta)).date()
+
             return None
+
+        def parse_absolute_date(date_str: str):
+            cleaned = re.sub(r'(\d)(st|nd|rd|th)\b', r'\1', date_str.strip(), flags=re.IGNORECASE)
+            cleaned = re.sub(r',', ' ', cleaned)
+            cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+
+            # Extract time if present (HH:MM with optional AM/PM)
+            time_match = re.search(r'(\d{1,2}):(\d{2})(?:\s*(?:am|pm))?', cleaned, re.IGNORECASE)
+            extracted_time = None
+            if time_match:
+                hour, minute = int(time_match.group(1)), int(time_match.group(2))
+                # Check for AM/PM
+                am_pm_match = re.search(r'(\d{1,2}):(\d{2})\s*(am|pm)', cleaned, re.IGNORECASE)
+                if am_pm_match:
+                    am_pm = am_pm_match.group(3).lower()
+                    if am_pm == 'pm' and hour != 12:
+                        hour += 12
+                    elif am_pm == 'am' and hour == 12:
+                        hour = 0
+                extracted_time = f"{hour:02d}:{minute:02d}:00.000Z"
+
+            numeric = re.fullmatch(r'(\d{1,4})[\-\/.](\d{1,2})[\-\/.](\d{1,4})', cleaned)
+            if numeric:
+                a, b, c = [int(x) for x in numeric.groups()]
+                year = month = day = None
+                if a >= 1000:
+                    year, month, day = a, b, c
+                else:
+                    year = c + 2000 if c < 100 else c
+                    if a > 12:
+                        day, month = a, b
+                    elif b > 12:
+                        month, day = a, b
+                    else:
+                        day, month = a, b
+                try:
+                    return (datetime(year, month, day).date(), extracted_time)
+                except ValueError:
+                    return (None, None)
+
+            try:
+                parsed = parse_date(cleaned, dayfirst=True, fuzzy=True, default=base_date)
+            except Exception:
+                return (None, None)
+
+            if not parsed:
+                return (None, None)
+
+            candidate = parsed.date()
+            if not _has_explicit_year(cleaned):
+                candidate = _normalize_yearless(candidate)
+            return (candidate, extracted_time)
+
+        def collect_candidates(text: str, stage: str, base_score: int):
+            candidates = []
+            for pattern in ABSOLUTE_PATTERNS:
+                for match in pattern.finditer(text):
+                    raw = match.group(0).strip()
+                    parsed_date, parsed_time = parse_absolute_date(raw)
+                    if parsed_date:
+                        candidates.append({'date': parsed_date, 'time': parsed_time, 'raw': raw, 'stage': stage, 'score': base_score})
+            for match in RELATIVE_PATTERN.finditer(text):
+                raw = match.group(0).strip()
+                parsed = parse_relative_date(raw)
+                if parsed:
+                    candidates.append({'date': parsed, 'time': None, 'raw': raw, 'stage': stage, 'score': base_score + 5})
+            return candidates
 
         # Get email content
         subject = email_data.get('subject', '')
         body = email_data.get('body', '')
         email_date = email_data.get('date')
-        
-        # Try to parse the email date for context
-        email_datetime = None
+
+        # Use email timestamp as parsing anchor when available.
+        base_date = datetime.now()
         if email_date:
             try:
-                email_datetime = parse_date(email_date)
-            except:
+                parsed_email_dt = parse_date(email_date)
+                if parsed_email_dt:
+                    base_date = parsed_email_dt
+            except Exception:
                 pass
 
-        # Combine subject and body for analysis
-        combined_text = f"{subject} {body}"
-        
-        # Normalize text: replace newlines with spaces for better matching
-        normalized_text = re.sub(r'\s+', ' ', combined_text)
-        
-        # Look for important deadline-related phrases with context
-        deadline_phrases = [
-            # Common deadline phrases - allow any chars including what was newlines
-            r'(?:deadline|due\s*(?:date)?|submit\s*by|register\s*(?:by|before)|last\s*(?:date|to\s+\w+)|closing\s*date|apply\s*by|expires?\s*on?|ends?\s*on?|before|until|no\s*later\s*than|not\s*after)\s*[:\-]?\s*(.{3,50})',
-            # Event-based deadlines
-            r'(?:hackathon|competition|internship|scholarship|conference|workshop|webinar|submission|application|registration)\s+(?:starts?|begins?|ends?|deadline|due|on|by|before)\s+(.{3,50})',
-            # "Last to X is DATE" pattern - now on normalized text
-            r'last\s+to\s+\w+(?:\s+\w+)?\s+(?:is|:)?\s*(.{3,30})',
-        ]
-        
-        # First try: Extract dates directly from the entire text
-        all_dates_in_text = extract_dates(normalized_text)
-        if all_dates_in_text:
-            logger.info(f"Found dates directly in text: {all_dates_in_text}")
-        
-        # Check for deadline phrases and extract potential dates
-        potential_dates = []
-        for pattern in deadline_phrases:
-            for match in re.finditer(pattern, normalized_text, re.IGNORECASE):
-                context = match.group(0)
-                date_part = match.group(1) if match.lastindex else context
-                
-                # Extract all dates from the matched context
-                dates_in_context = extract_dates(date_part)
-                if dates_in_context:
-                    for date_str in dates_in_context:
-                        potential_dates.append({
-                            'date_str': date_str,
-                            'context': context
-                        })
-                else:
-                    # The captured group might be a date itself
-                    potential_dates.append({
-                        'date_str': date_part.strip(),
-                        'context': context
-                    })
-        
-        # If no dates found in deadline phrases, use dates found anywhere in text
-        if not potential_dates and all_dates_in_text:
-            potential_dates = [{'date_str': d, 'context': f'Found date: {d}'} for d in all_dates_in_text]
-        
-        # Process and validate potential dates
-        for item in potential_dates:
-            date_str = item['date_str']
-            context = item['context']
-            
-            # Skip if date_str is too short or too long
-            if len(date_str) < 3 or len(date_str) > 50:
+
+        subject_text = re.sub(r'\s+', ' ', subject).strip()
+        combined_text = re.sub(r'\s+', ' ', f"{subject} {body}").strip()
+
+        candidates = []
+
+        # Stage 1: high-confidence windows around deadline keywords.
+        for km in KEYWORD_PATTERN.finditer(combined_text):
+            start = max(0, km.start() - 25)
+            end = min(len(combined_text), km.end() + 110)
+            window = combined_text[start:end]
+            candidates.extend(collect_candidates(window, 'keyword-window', 100))
+
+        # Stage 2: subject-only scan.
+        if subject_text:
+            candidates.extend(collect_candidates(subject_text, 'subject', 85))
+
+        # Stage 3: full-text fallback.
+        candidates.extend(collect_candidates(combined_text, 'full-text', 60))
+
+        if not candidates:
+            return None
+
+        today = datetime.now().date()
+        filtered = []
+        seen = set()
+        for item in candidates:
+            date_val = item['date']
+            if date_val < (today - timedelta(days=1)):
                 continue
-            
-            # Try to parse as relative date first
-            parsed_date = parse_relative_date(date_str, email_datetime)
-            
-            # If not a relative date, try parsing as absolute date
-            if not parsed_date:
-                parsed_date = parse_date_string(date_str)
-            
-            # Skip dates in the past (with 1-day grace period for timezone issues)
-            if parsed_date and parsed_date >= (datetime.now().date() - timedelta(days=1)):
-                # If we have a context, use it to create a better description
-                description = context if context else f"Deadline: {date_str}"
-                
-                # Clean up the description
-                description = re.sub(r'\s+', ' ', description).strip()
-                if len(description) > 200:
-                    description = description[:197] + '...'
-                
-                logger.info(f"Found deadline: {parsed_date} from '{date_str}' in context: {context[:50]}...")
-                    
-                return {
-                    'due_date': parsed_date.strftime('%Y-%m-%d'),
-                    'description': description
-                }
+            if date_val > (today + timedelta(days=730)):
+                continue
+            key = (item['raw'].lower(), date_val.isoformat(), item['stage'])
+            if key in seen:
+                continue
+            seen.add(key)
+            filtered.append(item)
+
+        if not filtered:
+            return None
+
+        filtered.sort(key=lambda x: (-x['score'], x['date']))
+        winner = filtered[0]
+        description = f"Detected from {winner['stage']}: {winner['raw']}"
+        extracted_time = winner.get('time')
         
-        return None
+        logger.info(
+            f"Found deadline: {winner['date']} from '{winner['raw']}' "
+            f"(stage={winner['stage']}, score={winner['score']}, time={extracted_time or 'N/A'})"
+        )
+
+        # If we have a date but no time, search the entire email for any time mention
+        if not extracted_time:
+            full_text = f"{subject} {body}".lower()
+            time_match = TIME_EXTRACTION_PATTERN.search(full_text)
+            if time_match:
+                if time_match.group(1):  # First pattern: H or HH with optional :MM and am/pm
+                    try:
+                        hour = int(time_match.group(1))
+                        minute = int(time_match.group(2)) if time_match.group(2) else 0
+                        am_pm = time_match.group(3).lower() if time_match.group(3) else None
+                        
+                        if am_pm:
+                            if am_pm == 'pm' and hour != 12:
+                                hour += 12
+                            elif am_pm == 'am' and hour == 12:
+                                hour = 0
+                        
+                        extracted_time = f"{hour:02d}:{minute:02d}:00.000Z"
+                    except (ValueError, TypeError):
+                        pass
+                elif time_match.group(4):  # Second pattern: 24-hour format HH:MM
+                    try:
+                        hour = int(time_match.group(4))
+                        minute = int(time_match.group(5)) if time_match.group(5) else 0
+                        extracted_time = f"{hour:02d}:{minute:02d}:00.000Z"
+                    except (ValueError, TypeError):
+                        pass
+                
+                if extracted_time:
+                    logger.info(f"Extracted time from email body: {extracted_time}")
+
+        return {
+            'due_date': winner['date'].strftime('%Y-%m-%d'),
+            'due_time': extracted_time,
+            'description': description[:200]
+        }
 
     def get_tasks(self, task_list_id: str, max_results: int = 100, show_completed: bool = True, show_hidden: bool = False) -> List[Dict[str, Any]]:
         """

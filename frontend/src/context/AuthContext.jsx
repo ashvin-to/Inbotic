@@ -45,18 +45,7 @@ export const AuthProvider = ({ children }) => {
         }
     };
 
-    const login = async (username, password) => {
-        const formData = new FormData();
-        formData.append('username', username);
-        formData.append('password', password);
 
-        const response = await api.post('/login', formData);
-        if (response.data.success) {
-            setUser(response.data.user);
-            return true;
-        }
-        return false;
-    };
 
     const logout = async () => {
         try {
@@ -70,7 +59,7 @@ export const AuthProvider = ({ children }) => {
     };
 
     return (
-        <AuthContext.Provider value={{ user, loading, login, logout, checkAuth }}>
+        <AuthContext.Provider value={{ user, loading, logout, checkAuth }}>
             {children}
         </AuthContext.Provider>
     );
