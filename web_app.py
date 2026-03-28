@@ -511,7 +511,7 @@ async def handle_gmail_first_auth(code: str, temp_state: str):
                 save_gmail_token(db, existing_user.id, tokens)
                 session_id = create_session(existing_user.id, existing_user.username, user_email)
                 response_redirect = RedirectResponse(_post_auth_redirect_url(), status_code=302)
-                response_redirect.set_cookie(key="session_id", value=session_id, max_age=86400, httponly=True, samesite="lax")
+                response_redirect.set_cookie(key="session_id", value=session_id, max_age=86400, httponly=True, samesite="none", secure=True)
                 return response_redirect
             else:
                 base_username = user_email.split("@")[0]
@@ -529,7 +529,7 @@ async def handle_gmail_first_auth(code: str, temp_state: str):
                 save_gmail_token(db, new_user.id, tokens)
                 session_id = create_session(new_user.id, new_user.username, user_email)
                 response_redirect = RedirectResponse(_post_auth_redirect_url(), status_code=302)
-                response_redirect.set_cookie(key="session_id", value=session_id, max_age=86400, httponly=True, samesite="lax")
+                response_redirect.set_cookie(key="session_id", value=session_id, max_age=86400, httponly=True, samesite="none", secure=True)
                 return response_redirect
         finally:
             db.close()
