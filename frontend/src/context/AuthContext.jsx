@@ -8,6 +8,16 @@ export const AuthProvider = ({ children }) => {
     const [loading, setLoading] = useState(true);
 
     useEffect(() => {
+        // Handle session_id in URL from cross-domain OAuth redirect
+        const params = new URLSearchParams(window.location.search);
+        const tokenFromUrl = params.get('session_id');
+        if (tokenFromUrl) {
+            localStorage.setItem('session_id', tokenFromUrl);
+            // Remove token from URL for clean look
+            const cleanUrl = window.location.pathname + window.location.hash;
+            window.history.replaceState({}, document.title, cleanUrl);
+        }
+
         checkAuth();
 
         // Add interceptor to handle 401s globally

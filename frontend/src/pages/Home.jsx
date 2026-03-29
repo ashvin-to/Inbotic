@@ -119,7 +119,7 @@ const Home = () => {
                                 {data.error || 'Your Google connection has expired.'}
                             </p>
                             <a
-                                href="http://localhost:8000/auth/gmail"
+                                href={`${import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'}/auth/gmail`}
                                 className="inline-block mt-3 btn-primary !px-4 !py-2 !text-xs"
                             >
                                 Reconnect Gmail

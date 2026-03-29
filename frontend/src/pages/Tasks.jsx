@@ -70,8 +70,8 @@ const Tasks = () => {
         return `${dateText}, ${timeText}`;
     };
 
-    const getTasksForList = (listId, source = tasks) => {
-        return source.filter(task => (task.list_id === listId) || (task.gmail_task_list_id === listId));
+    const getTasksForList = (listTitle, source = tasks) => {
+        return source.filter(task => task.list_name === listTitle);
     };
 
     const normalizedQuery = query.trim().toLowerCase();
@@ -148,13 +148,9 @@ const Tasks = () => {
     const handleSaveEdit = async (e) => {
         e.preventDefault();
         try {
-            const { id, list_id, title, notes, due, status, due_time } = editingTask;
-            // Append due_time if it exists
-            const due_date = due ? due.substring(0, 10) : '';
-            const final_due = due_time ? `${due_date}T${due_time}${due_time.length === 5 ? ':00' : ''}Z` : due_date;
-
+            const { id, list_id, title, notes, due, status } = editingTask;
             const response = await api.put(`/tasks/${id}`, {
-                list_id, title, notes, due: final_due, status
+                list_id, title, notes, due, status
             });
             // Update local state with returned task data
             const updatedTask = response.data.task;
@@ -187,6 +183,9 @@ const Tasks = () => {
                             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
                             Sync
                         </button>
+                        <Link to="/tasks/review" className="btn-secondary !text-sm flex items-center gap-2">
+                            ✨ AI Review
+                        </Link>
                     </div>
                 </div>
 
@@ -238,13 +237,13 @@ const Tasks = () => {
                             <div className="px-6 py-4 border-b border-black/10 dark:border-white/10 flex items-center justify-between">
                                 <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100">{taskList.title}</h3>
                                 <span className="text-xs font-medium px-2 py-1 rounded-full bg-emerald-100 text-emerald-800 dark:bg-emerald-900/45 dark:text-emerald-200">
-                                    {getTasksForList(taskList.id, visibleTasks).length} visible
+                                    {getTasksForList(taskList.title, visibleTasks).length} visible
                                 </span>
                             </div>
                             <div className="p-6">
-                                {getTasksForList(taskList.id, visibleTasks).length > 0 ? (
+                                {getTasksForList(taskList.title, visibleTasks).length > 0 ? (
                                     <div className="space-y-3">
-                                        {getTasksForList(taskList.id, visibleTasks).map((task) => (
+                                        {getTasksForList(taskList.title, visibleTasks).map((task) => (
                                             <div key={task.id} className="flex flex-col md:flex-row md:items-start md:justify-between gap-3 p-4 border border-black/10 dark:border-white/10 rounded-xl bg-white/70 dark:bg-gray-900/40 hover:bg-white/90 dark:hover:bg-gray-900/60 transition-colors">
                                                 <div className="flex-1 pr-4">
                                                     <div className="flex items-center mb-1">
@@ -333,25 +332,14 @@ const Tasks = () => {
                                     rows="4"
                                 />
                             </div>
-                            <div className="mb-4 grid grid-cols-2 gap-3">
-                                <div>
-                                    <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Due Date</label>
-                                    <input
-                                        type="date"
-                                        value={editingTask.due ? editingTask.due.substring(0, 10) : ''}
-                                        onChange={(e) => setEditingTask({ ...editingTask, due: e.target.value })}
-                                        className="form-input"
-                                    />
-                                </div>
-                                <div>
-                                    <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Time (24h UTC)</label>
-                                    <input
-                                        type="time"
-                                        value={editingTask.due_time ? editingTask.due_time.substring(0, 5) : ''}
-                                        onChange={(e) => setEditingTask({ ...editingTask, due_time: e.target.value })}
-                                        className="form-input"
-                                    />
-                                </div>
+                            <div className="mb-4">
+                                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Due Date</label>
+                                <input
+                                    type="date"
+                                    value={editingTask.due ? editingTask.due.substring(0, 10) : ''}
+                                    onChange={(e) => setEditingTask({ ...editingTask, due: e.target.value })}
+                                    className="form-input"
+                                />
                             </div>
                             <div className="mb-6">
                                 <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Status</label>

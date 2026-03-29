@@ -126,6 +126,30 @@ npm run build
    - `CLIENT_SECRET`
    - `GOOGLE_REDIRECT_URI` (your deployed callback URL)
    - `SECRET_KEY`
+   - `FRONTEND_URL` (your deployed frontend URL, e.g. `https://inbotic.onrender.com`)
+
+### Cross-domain auth notes (Render)
+
+If frontend and backend are on different domains, browsers may block or restrict third-party cookies.
+
+This app now supports a cookie-independent fallback for OAuth login:
+
+- OAuth callback redirects to `FRONTEND_URL` with a temporary `session_id` query param.
+- Frontend stores it and sends `Authorization: Bearer <session_id>` on API requests.
+- Backend accepts either session cookie or bearer session id.
+
+Recommended backend env vars for hosted deployments:
+
+- `INBOTIC_PRODUCTION=true`
+- `FRONTEND_URL=https://inbotic.onrender.com`
+- `GOOGLE_REDIRECT_URI=https://inbiotic.onrender.com/auth/callback`
+- Optional: `SESSION_COOKIE_SAMESITE=none`
+- Optional: `SESSION_COOKIE_SECURE=true`
+- Optional: `CORS_ALLOW_ORIGINS=https://inbotic.onrender.com`
+
+Optional hardening:
+
+- Set `OAUTH_STATE_SECRET` to a long random value for signed OAuth state verification.
 
 ## API docs
 

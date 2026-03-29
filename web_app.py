@@ -8,6 +8,9 @@ import sys
 import logging
 import json
 import re
+import hmac
+import hashlib
+import secrets
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 import asyncio
@@ -17,8 +20,9 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException, Depends, Form, Cookie, Response, Body, File, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 import uvicorn
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit, urlunsplit, parse_qsl
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -33,6 +37,7 @@ from user_service import create_user, authenticate_user, get_user_by_username, s
 from auth import create_access_token, verify_token, get_password_hash
 from gmail_service import GmailService
 from google_tasks_service import GoogleTasksService
+from llm_features.llm_client import LLMClient
 from google_oauth_config import resolve_google_oauth_client_config
 import pickle
 import smtplib
@@ -66,9 +71,38 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 # Add Middleware
 app.add_middleware(SlowAPIMiddleware)
 
+
+def _build_allowed_hosts() -> List[str]:
+    hosts = {
+        "localhost",
+        "127.0.0.1",
+        "0.0.0.0",
+    }
+
+    render_url = (os.getenv("RENDER_EXTERNAL_URL") or "").strip()
+    if render_url:
+        parts = urlsplit(render_url)
+        if parts.netloc:
+            hosts.add(parts.netloc)
+
+    frontend_url = (os.getenv("FRONTEND_URL") or "").strip()
+    if frontend_url:
+        parts = urlsplit(frontend_url)
+        if parts.netloc:
+            hosts.add(parts.netloc)
+
+    extra = (os.getenv("ALLOWED_HOSTS") or "").strip()
+    if extra:
+        for host in extra.split(","):
+            clean = host.strip()
+            if clean:
+                hosts.add(clean)
+
+    return sorted(hosts)
+
 app.add_middleware(
     TrustedHostMiddleware, 
-    allowed_hosts=["*"]
+    allowed_hosts=_build_allowed_hosts()
 )
 
 @app.middleware("http")
@@ -81,21 +115,40 @@ async def add_security_headers(request: Request, call_next):
     return response
 from fastapi.middleware.cors import CORSMiddleware
 
+
+def _build_cors_origins() -> List[str]:
+    origins = {
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    }
+
+    frontend_url = (os.getenv("FRONTEND_URL") or "").strip()
+    if frontend_url:
+        parts = urlsplit(frontend_url)
+        if parts.scheme and parts.netloc:
+            origins.add(f"{parts.scheme}://{parts.netloc}")
+
+    extra = (os.getenv("CORS_ALLOW_ORIGINS") or "").strip()
+    if extra:
+        for origin in extra.split(","):
+            clean = origin.strip()
+            if clean:
+                origins.add(clean)
+
+    return sorted(origins)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173", 
-        "http://127.0.0.1:5173",
-        os.getenv("FRONTEND_URL", "").rstrip("/")
-    ] if os.getenv("FRONTEND_URL") else ["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=_build_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Mount static files
-os.makedirs("static", exist_ok=True)
+# Mount static files and templates
 app.mount("/static", StaticFiles(directory="static"), name="static")
+templates = Jinja2Templates(directory="templates")
+templates.env.globals["now"] = datetime.now
 
 # Initialize database
 create_tables()
@@ -119,6 +172,8 @@ def _is_production_deployment() -> bool:
         _env_bool("INBOTIC_PRODUCTION", False),
         bool(os.getenv("VERCEL")),
         bool(os.getenv("NETLIFY")),
+        bool(os.getenv("RENDER")),
+        bool(os.getenv("RENDER_EXTERNAL_URL")),
     ])
 
 
@@ -128,11 +183,89 @@ def _manual_oauth_allowed() -> bool:
     return _env_bool("INBOTIC_ALLOW_MANUAL_OAUTH", manual_default)
 
 
-def _post_auth_redirect_url() -> str:
+def _oauth_state_secret() -> str:
+    return (os.getenv("OAUTH_STATE_SECRET") or os.getenv("SECRET_KEY") or "inbotic-dev-secret").strip()
+
+
+def _create_oauth_state() -> str:
+    ts = int(datetime.utcnow().timestamp())
+    nonce = secrets.token_urlsafe(16)
+    payload = f"{ts}:{nonce}"
+    signature = hmac.new(_oauth_state_secret().encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{payload}:{signature}"
+
+
+def _is_valid_oauth_state(state: str, *, max_age_seconds: int = 900) -> bool:
+    if not state:
+        return False
+
+    parts = state.split(":")
+    if len(parts) != 3:
+        return False
+
+    ts_raw, nonce, signature = parts
+    if not ts_raw.isdigit() or not nonce or not signature:
+        return False
+
+    payload = f"{ts_raw}:{nonce}"
+    expected = hmac.new(_oauth_state_secret().encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        return False
+
+    ts = int(ts_raw)
+    age = int(datetime.utcnow().timestamp()) - ts
+    return 0 <= age <= max_age_seconds
+
+
+def _session_cookie_settings() -> Dict[str, Any]:
+    default_prod = _is_production_deployment()
+    default_samesite = "none" if default_prod else "lax"
+    samesite = (os.getenv("SESSION_COOKIE_SAMESITE") or default_samesite).strip().lower()
+    if samesite not in {"lax", "strict", "none"}:
+        samesite = default_samesite
+
+    secure_default = default_prod or samesite == "none"
+    secure = _env_bool("SESSION_COOKIE_SECURE", secure_default)
+
+    return {
+        "max_age": 86400,
+        "httponly": True,
+        "samesite": samesite,
+        "secure": secure,
+    }
+
+
+def _set_session_cookie(response: Response, session_id: str) -> None:
+    response.set_cookie(
+        key="session_id",
+        value=session_id,
+        **_session_cookie_settings(),
+    )
+
+
+def _delete_session_cookie(response: Response) -> None:
+    settings = _session_cookie_settings()
+    response.delete_cookie(
+        key="session_id",
+        httponly=True,
+        samesite=settings["samesite"],
+        secure=settings["secure"],
+    )
+
+
+def _post_auth_redirect_url(session_id: Optional[str] = None) -> str:
     """Return where users should land after OAuth callback succeeds."""
     frontend_url = (os.getenv("FRONTEND_URL") or "").strip()
     if frontend_url:
-        return frontend_url.rstrip("/") + "/"
+        target = frontend_url.rstrip("/") + "/"
+        if not session_id:
+            return target
+
+        parts = urlsplit(target)
+        query = dict(parse_qsl(parts.query, keep_blank_values=True))
+        query["session_id"] = session_id
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+    # Safe fallback for backend-only/Jinja usage.
     return "/"
 
 
@@ -141,9 +274,127 @@ def _has_shared_oauth_credentials() -> bool:
     return bool(client_id and client_secret)
 
 
+def render_oauth_choice_page(shared_available: bool, allow_manual: bool):
+    """Render a simple chooser for hosted OAuth vs manual OAuth setup."""
+    shared_disabled = "disabled" if not shared_available else ""
+    shared_note = "" if shared_available else "<p class='muted' style='color:#b00020;'>Hosted OAuth is not configured on this server yet.</p>"
+
+    manual_card = ""
+    if allow_manual:
+        manual_card = """
+        <div class='card'>
+            <h3>Use My Own OAuth Credentials</h3>
+            <p>Upload your OAuth JSON or paste Client ID and Client Secret.</p>
+            <a class='btn secondary' href='/setup/google-credentials'>Manual Setup</a>
+        </div>
+        """
+
+    html = f"""
+    <html>
+        <head>
+            <title>Choose Sign-In Method</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 2rem; line-height: 1.5; }}
+                .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; max-width: 900px; }}
+                .card {{ border: 1px solid #ddd; border-radius: 10px; padding: 1.25rem; }}
+                .btn {{ margin-top: 0.8rem; display: inline-block; text-decoration: none; padding: 0.6rem 1rem; border-radius: 8px; background: #0a66c2; color: #fff; }}
+                .btn.secondary {{ background: #444; }}
+                .btn[disabled] {{ pointer-events: none; opacity: 0.5; }}
+                .muted {{ color: #666; font-size: 0.95rem; }}
+            </style>
+        </head>
+        <body>
+            <h1>Choose how to connect Gmail</h1>
+            <p class='muted'>You can sign in using hosted OAuth managed by this app, or configure your own Google OAuth credentials.</p>
+            <div class='grid'>
+                <div class='card'>
+                    <h3>Use Hosted OAuth</h3>
+                    <p>This is easiest for end users. They just sign in with Google.</p>
+                    {shared_note}
+                    <a class='btn' href='/auth/gmail?mode=shared' {shared_disabled}>Continue with Hosted OAuth</a>
+                </div>
+                {manual_card}
+            </div>
+        </body>
+    </html>
+    """
+    return HTMLResponse(html)
+
+
+def render_oauth_setup_page(message: str = "", is_error: bool = False):
+    """Render a simple browser-based setup page for Google OAuth credentials."""
+    status_style = "color:#b00020;" if is_error else "color:#0a7c2f;"
+    status_html = f"<p style='{status_style}'>{message}</p>" if message else ""
+
+    html = f"""
+    <html>
+        <head>
+            <title>Inbotic Setup</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 2rem; line-height: 1.5; }}
+                .card {{ max-width: 760px; border: 1px solid #ddd; border-radius: 10px; padding: 1.25rem; }}
+                .muted {{ color: #666; font-size: 0.95rem; }}
+                label {{ font-weight: 600; display: block; margin-top: 1rem; }}
+                input[type='file'], input[type='text'] {{ width: 100%; padding: 0.5rem; margin-top: 0.35rem; }}
+                button {{ margin-top: 1rem; padding: 0.6rem 1rem; border: 0; border-radius: 8px; background: #0a66c2; color: #fff; cursor: pointer; }}
+                code {{ background: #f5f5f5; padding: 0.12rem 0.3rem; border-radius: 4px; }}
+            </style>
+        </head>
+        <body>
+            <h1>One-time Google setup</h1>
+            <div class='card'>
+                <p>Use this page to configure OAuth without editing environment variables manually.</p>
+                {status_html}
+                <ol>
+                    <li>Create OAuth credentials in Google Cloud (see quick steps below).</li>
+                    <li>Either upload OAuth JSON or paste Client ID/Client Secret.</li>
+                    <li>Click Save, then Connect Gmail.</li>
+                </ol>
+
+                <div class='muted'>
+                    <p><strong>Quick Google OAuth steps</strong></p>
+                    <ol>
+                        <li>Open Google Cloud Console and create/select a project.</li>
+                        <li>Enable Gmail API and Google Tasks API.</li>
+                        <li>Configure OAuth consent screen.</li>
+                        <li>Create OAuth Client ID (Web application).</li>
+                        <li>Add redirect URI: http://localhost:8000/auth/callback</li>
+                        <li>Copy Client ID and Client Secret (or download JSON).</li>
+                    </ol>
+                </div>
+
+                <form action='/setup/google-credentials' method='post' enctype='multipart/form-data'>
+                    <label>Option A: Upload Google OAuth credentials JSON</label>
+                    <input type='file' name='credentials_file' accept='.json,application/json' />
+
+                    <p class='muted'>Option B (skip JSON): paste these values directly.</p>
+                    <label>Client ID</label>
+                    <input type='text' name='client_id' placeholder='your-google-oauth-client-id' />
+
+                    <label>Client Secret</label>
+                    <input type='text' name='client_secret' placeholder='your-google-oauth-client-secret' />
+
+                    <button type='submit'>Save and Continue</button>
+                </form>
+
+                <p class='muted'>If you upload JSON, it is saved to <code>.secrets/google-credentials.json</code>.</p>
+                <p><a href='/auth/gmail'>Back to sign-in options</a></p>
+            </div>
+        </body>
+    </html>
+    """
+    return HTMLResponse(html)
+
 def get_current_user_from_session(request: Request):
-    """Get current user from session cookie"""
+    """Get current user from cookie first, then bearer fallback for cross-domain auth."""
     session_id = request.cookies.get("session_id")
+    if not session_id:
+        auth_header = (request.headers.get("Authorization") or "").strip()
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+            if token:
+                session_id = token
+
     if session_id and session_id in sessions:
         return sessions[session_id]
     return None
@@ -222,70 +473,26 @@ def _process_user_emails_once(
 
     processed_count = 0
     task_list_id = task_list['id']
-    
-    db = SessionLocal()
-    try:
-        for email in emails:
-            email_id = email.get('id')
-            if not email_id:
-                continue
-                
-            # 1. Check if email was already processed in our DB
-            existing_email = db.query(Email).filter(
-                Email.user_id == user_id,
-                Email.gmail_message_id == email_id
-            ).first()
-            
-            if existing_email and existing_email.processed:
-                logger.debug(f"Email {email_id} already processed for {username}; skipping.")
-                continue
-            
-            # If it exists but not processed, we'll try now.
-            # If it doesn't exist, we'll create it now.
-            if not existing_email:
-                existing_email = Email(
-                    user_id=user_id,
-                    gmail_message_id=email_id,
-                    subject=email.get('subject', 'No Subject'),
-                    sender=email.get('sender', 'Unknown'),
-                    body=email.get('body', ''),
-                    received_at=datetime.now(), # Approximate if parsing fails
-                    processed=False
-                )
-                db.add(existing_email)
-                db.commit()
-                db.refresh(existing_email)
 
-            try:
-                tasks = tasks_svc.create_tasks_from_email(
-                    task_list_id=task_list_id,
-                    email_data=email,
-                    extract_deadlines=True,
-                    max_days_ahead=max_days_ahead,
-                    default_due_time_utc="09:00:00.000Z",
-                    create_action_tasks=False,
-                    pre_reminder_days=pre_reminder_days,
-                    pre_reminder_hours=pre_reminder_hours,
-                    create_pre_reminder=True,
-                    dedupe=True,
-                )
-                
-                # Mark as processed in our DB regardless of whether tasks were created
-                # (if no tasks found, we don't want to keep checking every time)
-                existing_email.processed = True
-                db.commit()
-                
-                is_dedupe = tasks and len(tasks) == 1 and tasks[0].get('dedupe')
-                if tasks and not is_dedupe:
-                    processed_count += 1
-                    
-            except Exception as e:
-                logger.error(f"Error processing email {email_id} for user {username}: {e}")
-                # Don't mark as processed on error so we can retry
-                db.rollback()
-
-    finally:
-        db.close()
+    for email in emails:
+        try:
+            tasks = tasks_svc.create_tasks_from_email(
+                task_list_id=task_list_id,
+                email_data=email,
+                extract_deadlines=True,
+                max_days_ahead=max_days_ahead,
+                default_due_time_utc="09:00:00.000Z",
+                create_action_tasks=False,
+                pre_reminder_days=pre_reminder_days,
+                pre_reminder_hours=pre_reminder_hours,
+                create_pre_reminder=True,
+                dedupe=True,
+            )
+            is_dedupe = tasks and len(tasks) == 1 and tasks[0].get('dedupe')
+            if tasks and not is_dedupe:
+                processed_count += 1
+        except Exception as e:
+            logger.error(f"Error processing email {email.get('id', 'unknown')} for user {username}: {e}")
 
     return {"processed": processed_count, "total": len(emails)}
 
@@ -367,46 +574,204 @@ async def shutdown_auto_process():
             pass
         auto_process_task = None
 
-@app.get("/")
-async def root(request: Request):
+@app.get("/", response_class=HTMLResponse)
+async def home(request: Request):
+    """Home page - Gmail-first approach"""
+    session_id = request.cookies.get("session_id")
     user = get_current_user_from_session(request)
+    context = {
+        "request": request,
+        "title": "Inbotic - Gmail to Google Tasks"
+    }
+
     if user:
-        return JSONResponse({
-            "message": f"Inbotic API is running. Hello {user['username']}!",
-            "status": "authenticated",
-            "frontend": os.getenv("FRONTEND_URL", "http://localhost:5173")
-        })
-    return JSONResponse({
-        "message": "Inbotic API is running. Please connect via Gmail.",
-        "status": "guest",
-        "auth_url": "/auth/gmail"
-    })
+        # User is logged in - show dashboard
+        gmail_svc, tasks_svc = get_user_services(user["user_id"])
+        # Include LLM chat history in context
+        if session_id and session_id in sessions:
+            context["chat_messages"] = sessions[session_id].get("chat", [])
+
+        if gmail_svc and tasks_svc:
+            try:
+                # Get user's task lists
+                task_lists = tasks_svc.get_task_lists()
+                # Count tasks in our app's list only (more meaningful than total lists)
+                ia_title = f"Inbotic - {user['username']}"
+                ia_tasks_count = 0
+                recent_activity = "No recent activity found."
+
+                try:
+                    ia_list = next((tl for tl in task_lists if tl.get('title') == ia_title), None)
+                    if ia_list:
+                        ia_tasks = tasks_svc.get_tasks(ia_list['id'], max_results=200)
+                        ia_tasks_count = len(ia_tasks or [])
+
+                        # Get recent tasks for activity feed
+                        if ia_tasks:
+                            # Sort by updated/created if available, or just take top
+                            # Google Tasks API returns in default order (usually custom), so we take top 3
+                            recent_tasks = ia_tasks[:3]
+                            activity_lines = []
+                            for t in recent_tasks:
+                                status = "Completed" if t.get('status') == 'completed' else "Created"
+                                title = t.get('title', 'Untitled task')
+                                activity_lines.append(f"{status}: {title}")
+
+                            if activity_lines:
+                                recent_activity = " | ".join(activity_lines)
+                    else:
+                        ia_tasks_count = 0
+                except Exception:
+                    ia_tasks_count = 0
+
+                context.update({
+                    "authenticated": True,
+                    "user": user,
+                    "task_lists": task_lists,
+                    "ia_tasks_count": ia_tasks_count,
+                    "recent_activity": recent_activity,
+                })
+            except Exception as e:
+                error_str = str(e)
+                if "invalid_grant" in error_str or "Token has been expired" in error_str:
+                    logger.warning(f"Token expired for user {user['username']}: {e}")
+                    context["error"] = "Your Google connection has expired. Please reconnect."
+                    context["needs_reauth"] = True
+                else:
+                    logger.error(f"Error loading user dashboard: {e}")
+                    context["error"] = "Error loading dashboard"
+        else:
+            context.update({
+                "authenticated": True,
+                "user": user,
+                "needs_gmail": True
+            })
+    else:
+        # User not logged in - show Gmail-first onboarding
+        context["authenticated"] = False
+        context["gmail_first"] = True
+        context["oauth_shared_available"] = _has_shared_oauth_credentials()
+        context["oauth_manual_allowed"] = _manual_oauth_allowed()
+
+    return templates.TemplateResponse("index.html", context)
+
+@app.post("/chat/send")
+@app.post("/api/chat/send")
+async def chat_send(request: Request, prompt: str = Form(None), chat_message: str = Form(None)):
+    """LLM chat endpoint; stores conversation in in-memory session and redirects to home."""
+    session_id = request.cookies.get("session_id")
+    if not session_id or session_id not in sessions:
+        return RedirectResponse("/login", status_code=302)
+
+    # Initialize history
+    history = sessions[session_id].setdefault("chat", [])
+
+    # Build messages for LLM from history (capped length) with a guiding system prompt
+    messages = []
+
+    # Try to enrich with user context (recent emails and upcoming tasks)
+    context_lines = []
+    try:
+        user = get_current_user_from_session(request)
+        gmail_svc, tasks_svc = get_user_services(user["user_id"]) if user else (None, None)
+        if gmail_svc:
+            # Try strict: unread + inbox, last 1 day; then relax
+            emails = gmail_svc.get_recent_emails(max_results=5, days_back=1, unread_only=True, inbox_only=True)
+            if not emails:
+                emails = gmail_svc.get_recent_emails(max_results=5, days_back=3, unread_only=False, inbox_only=True)
+            if not emails:
+                emails = gmail_svc.get_recent_emails(max_results=5, days_back=7, unread_only=False, inbox_only=False)
+            if emails:
+                context_lines.append("RecentEmails:")
+                for e in emails:
+                    subj = (e.get('subject') or 'No Subject')
+                    context_lines.append(f"- {subj[:120]}")
+        if tasks_svc:
+            lists = tasks_svc.get_task_lists()
+            upcoming = []
+            from datetime import datetime as _dt
+            for tl in lists:
+                for t in tasks_svc.get_tasks(tl['id'], max_results=50):
+                    due = t.get('due')
+                    if due:
+                        try:
+                            d = _dt.strptime(due[:10], '%Y-%m-%d').date()
+                            upcoming.append((d, tl.get('title'), t.get('title')))
+                        except Exception:
+                            pass
+            if upcoming:
+                upcoming.sort(key=lambda x: x[0])
+                context_lines.append("UpcomingTasks:")
+                for d, lst, title in upcoming[:10]:
+                    context_lines.append(f"- {d.isoformat()} · {lst}: {title[:100]}")
+    except Exception as _:
+        pass
+
+    system_content = (
+        "You are the Inbotic assistant. Be concise and helpful. "
+        "Use the provided context about the user's emails and tasks when relevant.\n" +
+        ("\n".join(context_lines) if context_lines else "")
+    )
+    messages.append({"role": "system", "content": system_content})
+    # Stateless chat: do NOT include previous turns in the prompt
+    # Prefer chat_message (new UI) but fall back to prompt (back-compat)
+    user_text = chat_message if chat_message is not None else (prompt or "")
+    messages.append({"role": "user", "content": user_text})
+
+    try:
+        reply = LLMClient._chat_complete(messages=messages, temperature=0.5, max_tokens=600)
+    except Exception as e:
+        reply = f"Sorry, the assistant is unavailable right now. ({e})"
+
+    # Sanitize odd special tokens and whitespace from reply
+    try:
+        import re as _re
+        reply_clean = _re.sub(r"</?s>", "", reply).strip()
+        reply = reply_clean or "(No response generated)"
+    except Exception:
+        reply = reply.strip() or "(No response generated)"
+
+    # Save back to session
+    history.append({"role": "user", "content": user_text})
+    history.append({"role": "assistant", "content": reply})
+    sessions[session_id]["chat"] = history
+
+    sessions[session_id]["chat"] = history
+
+    if "application/json" in request.headers.get("accept", ""):
+        return JSONResponse({"reply": reply, "history": history})
+    return RedirectResponse("/", status_code=302)
 
 @app.get("/auth/gmail")
 async def auth_gmail(request: Request, mode: str = None):
-    """Initiate Gmail OAuth2 authentication"""
+    """Initiate Gmail OAuth2 authentication (Gmail-first approach)"""
     allow_manual = _manual_oauth_allowed()
     shared_available = _has_shared_oauth_credentials()
 
+    # Let users choose between hosted OAuth and manual setup when both are enabled.
     if mode not in {"shared", "manual"}:
-        if shared_available:
+        if shared_available and allow_manual:
+            return render_oauth_choice_page(shared_available=True, allow_manual=True)
+        if shared_available and not allow_manual:
             mode = "shared"
-        elif allow_manual:
+        if not shared_available:
+            if not allow_manual:
+                return HTMLResponse(
+                    "<h1>OAuth not configured</h1><p>Hosted OAuth credentials are missing and manual setup is disabled on this deployment.</p>",
+                    status_code=500,
+                )
             return RedirectResponse("/setup/google-credentials", status_code=302)
-        else:
-            return JSONResponse({"error": "OAuth not configured. Set CLIENT_ID/CLIENT_SECRET."}, status_code=500)
 
     if mode == "manual":
         if not allow_manual:
-            return JSONResponse({"error": "Manual setup disabled"}, status_code=403)
+            return HTMLResponse("<h1>Manual setup is disabled</h1>", status_code=403)
         return RedirectResponse("/setup/google-credentials", status_code=302)
 
-    if mode == "shared" and not shared_available:
+    if not shared_available:
         return RedirectResponse("/setup/google-credentials", status_code=302)
 
-    import uuid
-    temp_state = str(uuid.uuid4())
-    sessions[temp_state] = {"temp_state": True, "created_at": datetime.now()}
+    # Signed state token avoids in-memory callback dependency across process restarts.
+    temp_state = _create_oauth_state()
 
     client_id, _ = resolve_google_oauth_client_config()
     redirect_uri = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/callback")
@@ -433,7 +798,8 @@ async def auth_gmail(request: Request, mode: str = None):
 
 @app.get("/setup/google-credentials")
 async def setup_google_credentials_page():
-    return JSONResponse({"message": "Please POST to /setup/google-credentials with credentials"})
+    """Beginner-friendly setup page for Google OAuth credentials."""
+    return render_oauth_setup_page()
 
 
 @app.post("/setup/google-credentials")
@@ -442,7 +808,7 @@ async def setup_google_credentials(
     client_id: str = Form(""),
     client_secret: str = Form(""),
 ):
-    """Save Google OAuth credentials."""
+    """Save Google OAuth credentials from uploaded JSON or manual inputs."""
     client_id = (client_id or "").strip()
     client_secret = (client_secret or "").strip()
 
@@ -450,42 +816,71 @@ async def setup_google_credentials(
         try:
             raw_bytes = await credentials_file.read()
             payload = json.loads(raw_bytes.decode("utf-8"))
+
+            web_block = payload.get("web") if isinstance(payload, dict) else None
+            installed_block = payload.get("installed") if isinstance(payload, dict) else None
+
+            if isinstance(web_block, dict):
+                client_id = client_id or (web_block.get("client_id") or "").strip()
+                client_secret = client_secret or (web_block.get("client_secret") or "").strip()
+            if isinstance(installed_block, dict):
+                client_id = client_id or (installed_block.get("client_id") or "").strip()
+                client_secret = client_secret or (installed_block.get("client_secret") or "").strip()
+
+            # Also support flat payload shape just in case.
+            client_id = client_id or (payload.get("client_id") or "").strip()
+            client_secret = client_secret or (payload.get("client_secret") or "").strip()
+
             secrets_dir = Path(".secrets")
             secrets_dir.mkdir(parents=True, exist_ok=True)
             output_path = secrets_dir / "google-credentials.json"
             output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
             os.environ["GOOGLE_CREDENTIALS_PATH"] = str(output_path)
         except Exception as e:
-            return JSONResponse({"error": f"Could not read JSON: {e}"}, status_code=400)
+            return render_oauth_setup_page(f"Could not read uploaded JSON: {e}", is_error=True)
 
     if not client_id or not client_secret:
-        return JSONResponse({"error": "Missing credentials"}, status_code=400)
+        return render_oauth_setup_page(
+            "Missing client_id/client_secret. Upload a valid OAuth JSON file or fill both fields.",
+            is_error=True,
+        )
 
+    # Keep values in memory for this run; persisted values can be added in .env if desired.
     os.environ["CLIENT_ID"] = client_id
     os.environ["CLIENT_SECRET"] = client_secret
+
+    # After saving manual credentials, immediately start OAuth consent.
     return RedirectResponse("/auth/gmail?mode=shared", status_code=302)
 
 @app.get("/auth/callback")
 async def auth_callback(code: str = None, state: str = None, error: str = None):
-    """Handle OAuth2 callback"""
+    """Handle OAuth2 callback - create/register user"""
     if error:
-        return JSONResponse({"error": error}, status_code=400)
-    if not code or not state:
-        return JSONResponse({"error": "Missing code or state"}, status_code=400)
+        return HTMLResponse(f"<h1>Authentication failed</h1><p>Error: {error}</p><p><a href='/'>Try Again</a></p>")
 
-    if state in sessions and sessions[state].get("temp_state"):
+    if not code or not state:
+        return HTMLResponse("<h1>Authentication failed</h1><p>Missing authorization code or state</p><p><a href='/'>Try Again</a></p>")
+
+    # Validate signed OAuth state without requiring in-memory state storage.
+    if _is_valid_oauth_state(state):
         return await handle_gmail_first_auth(code, state)
-    return RedirectResponse("/auth/gmail", status_code=302)
+    else:
+        # Legacy flow - redirect to login
+        return RedirectResponse("/login?message=Please+login+first", status_code=302)
 
 async def handle_gmail_first_auth(code: str, temp_state: str):
     """Handle Gmail-first authentication and user registration"""
     try:
+        # Exchange code for token
         token_url = "https://oauth2.googleapis.com/token"
         client_id, client_secret = resolve_google_oauth_client_config()
         redirect_uri = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/callback")
 
         if not client_id or not client_secret:
-            return JSONResponse({"error": "Configuration error"}, status_code=500)
+            return HTMLResponse(
+                "<h1>Configuration error</h1><p>Missing Google OAuth credentials. Set CLIENT_ID/CLIENT_SECRET or place your Google credentials JSON at .secrets/google-credentials.json.</p>",
+                status_code=500,
+            )
 
         data = {
             'code': code,
@@ -500,20 +895,28 @@ async def handle_gmail_first_auth(code: str, temp_state: str):
         response.raise_for_status()
 
         tokens = response.json()
+
+        # Get user profile from Gmail
         gmail_service = GmailService.from_user_token(tokens)
         profile = gmail_service.service.users().getProfile(userId='me').execute()
         user_email = profile['emailAddress']
 
+        # Check if user already exists
         db = SessionLocal()
         try:
             existing_user = db.query(User).filter(User.email == user_email).first()
+
             if existing_user:
+                # User exists - update their Gmail token and login
                 save_gmail_token(db, existing_user.id, tokens)
                 session_id = create_session(existing_user.id, existing_user.username, user_email)
-                response_redirect = RedirectResponse(_post_auth_redirect_url(), status_code=302)
-                response_redirect.set_cookie(key="session_id", value=session_id, max_age=86400, httponly=True, samesite="none", secure=True)
+
+                response_redirect = RedirectResponse(_post_auth_redirect_url(session_id=session_id), status_code=302)
+                _set_session_cookie(response_redirect, session_id)
+                logger.info(f"Existing user {existing_user.username} connected Gmail")
                 return response_redirect
             else:
+                # Auto-provision a new local user using Gmail identity
                 base_username = user_email.split("@")[0]
                 username = base_username
                 suffix = 1
@@ -522,34 +925,142 @@ async def handle_gmail_first_auth(code: str, temp_state: str):
                     username = f"{base_username}{suffix}"
 
                 random_password = __import__("secrets").token_urlsafe(12)
-                new_user = User(email=user_email, username=username, hashed_password=get_password_hash(random_password))
+                hashed_password = get_password_hash(random_password)
+
+                new_user = User(
+                    email=user_email,
+                    username=username,
+                    hashed_password=hashed_password
+                )
                 db.add(new_user)
                 db.commit()
                 db.refresh(new_user)
+
+                # Save Gmail tokens and start a session
                 save_gmail_token(db, new_user.id, tokens)
                 session_id = create_session(new_user.id, new_user.username, user_email)
-                response_redirect = RedirectResponse(_post_auth_redirect_url(), status_code=302)
-                response_redirect.set_cookie(key="session_id", value=session_id, max_age=86400, httponly=True, samesite="none", secure=True)
+
+                response_redirect = RedirectResponse(_post_auth_redirect_url(session_id=session_id), status_code=302)
+                _set_session_cookie(response_redirect, session_id)
+                logger.info(f"Auto-provisioned user {username} from Gmail {user_email}")
                 return response_redirect
+
         finally:
             db.close()
+
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        logger.error(f"OAuth2 callback failed: {e}")
+        return HTMLResponse(f"<h1>Authentication failed</h1><p>Error: {e}</p><p><a href='/'>Try Again</a></p>")
 
 @app.post("/register")
-@app.post("/api/register")
-async def register(request: Request):
-    return JSONResponse({"error": "Manual registration disabled. Please use Gmail login."}, status_code=401)
+async def register(
+    request: Request,
+    response: Response,
+    email: str = Form(...),
+    username: str = Form(...),
+    password: str = Form(...),
+    confirm_password: str = Form(...),
+    state: str = Form(None)
+):
+    """Handle user registration - enhanced for Gmail-first flow"""
+    if password != confirm_password:
+        return RedirectResponse("/register?error=Passwords+do+not+match", status_code=302)
+
+    if len(password) < 6:
+        return RedirectResponse("/register?error=Password+must+be+at+least+6+characters", status_code=302)
+
+    db = SessionLocal()
+    try:
+        # Check if user already exists
+        existing_user = db.query(User).filter(
+            (User.email == email) | (User.username == username)
+        ).first()
+
+        if existing_user:
+            return RedirectResponse("/register?error=Username+or+email+already+exists", status_code=302)
+
+        # Create new user
+        hashed_password = get_password_hash(password)
+        new_user = User(
+            email=email,
+            username=username,
+            hashed_password=hashed_password
+        )
+        db.add(new_user)
+        db.commit()
+        db.refresh(new_user)
+
+        # If Gmail was connected first, save the tokens
+        if state and state in sessions:
+            session_data = sessions[state]
+            if session_data.get("gmail_tokens"):
+                save_gmail_token(db, new_user.id, session_data["gmail_tokens"])
+
+        # Create session
+        session_id = create_session(new_user.id, new_user.username, email)
+
+        # Prepare redirect and set session cookie on the redirect response
+        redirect_resp = RedirectResponse("/", status_code=302)
+        _set_session_cookie(redirect_resp, session_id)
+
+        # Clean up temp state
+        if state and state in sessions:
+            del sessions[state]
+
+        logger.info(f"User {username} registered successfully")
+        return redirect_resp
+    finally:
+        db.close()
 
 @app.post("/login")
 @app.post("/api/login")
-async def login(request: Request):
-    return JSONResponse({"error": "Manual login disabled. Please use Gmail login."}, status_code=401)
+@limiter.limit("5/minute")
+async def login(
+    request: Request,
+    response: Response,
+    username: str = Form(...),
+    password: str = Form(...)
+):
+    """Handle user login"""
+    db = SessionLocal()
+    try:
+        user = authenticate_user(db, username, password)
+        if not user:
+            # For API requests, return JSON error
+            if "application/json" in request.headers.get("accept", "") or request.url.path.startswith("/api/"):
+                return JSONResponse({"success": False, "message": "Invalid credentials"}, status_code=401)
+            return RedirectResponse("/login?error=Invalid+credentials", status_code=302)
+
+        # Create session
+        session_id = create_session(user.id, user.username, user.email)
+
+        logger.info(f"User {username} logged in successfully")
+
+        # Check if this is an API request
+        if "application/json" in request.headers.get("accept", "") or request.url.path.startswith("/api/"):
+            response = JSONResponse({
+                "success": True,
+                "user": {
+                    "username": user.username,
+                    "email": user.email,
+                    "profile_photo": user.profile_photo
+                }
+            })
+            _set_session_cookie(response, session_id)
+            return response
+
+        # Prepare redirect and set session cookie on the redirect response
+        redirect_resp = RedirectResponse("/", status_code=302)
+        _set_session_cookie(redirect_resp, session_id)
+        return redirect_resp
+    finally:
+        db.close()
 
 @app.get("/logout")
 async def logout(response: Response):
+    """Handle user logout"""
     redirect_resp = RedirectResponse("/", status_code=302)
-    redirect_resp.delete_cookie(key="session_id")
+    _delete_session_cookie(redirect_resp)
     return redirect_resp
 
 @app.post("/process-emails")
@@ -562,13 +1073,14 @@ async def process_emails(
     pre_reminder_hours: int = Form(0),
     max_days_ahead: int = Form(60)
 ):
+    """Manually trigger email processing for current user"""
     user = get_current_user_from_session(request)
     if not user:
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+        return RedirectResponse("/login", status_code=302)
 
     gmail_svc, tasks_svc = get_user_services(user["user_id"])
     if not gmail_svc or not tasks_svc:
-        return JSONResponse({"error": "Gmail not connected"}, status_code=400)
+        return RedirectResponse("/?error=Gmail+not+connected", status_code=302)
 
     try:
         result = _process_user_emails_once(
@@ -580,19 +1092,174 @@ async def process_emails(
             pre_reminder_hours=pre_reminder_hours,
             max_days_ahead=max_days_ahead,
         )
-        
+
+        if result["total"] == 0:
+            if "application/json" in request.headers.get("accept", ""):
+                return JSONResponse({"message": "No emails found", "processed_count": 0, "total_emails": 0})
+            return RedirectResponse("/?message=No+emails+found", status_code=302)
+
         message = f"Successfully processed {result['processed']} out of {result['total']} emails"
-        return JSONResponse({
-            "message": message,
-            "processed_count": result['processed'],
-            "total_emails": result['total']
-        })
+        if "application/json" in request.headers.get("accept", ""):
+            return JSONResponse({"message": message, "processed_count": result['processed'], "total_emails": result['total']})
+        return RedirectResponse(f"/?message={message}", status_code=302)
 
     except Exception as e:
         logger.error(f"Error processing emails: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
+        if "application/json" in request.headers.get("accept", ""):
+            return JSONResponse({"error": str(e)}, status_code=500)
+        return RedirectResponse(f"/?error=Error+processing+emails", status_code=302)
 
-    return JSONResponse({"error": "AI Review is disabled."}, status_code=404)
+@app.get("/tasks", response_class=HTMLResponse)
+async def view_tasks(request: Request):
+    """View tasks for current user"""
+    user = get_current_user_from_session(request)
+    if not user:
+        return RedirectResponse("/login", status_code=302)
+
+    gmail_svc, tasks_svc = get_user_services(user["user_id"])
+    if not gmail_svc or not tasks_svc:
+        return RedirectResponse("/?error=Gmail+not+connected", status_code=302)
+
+    try:
+        # Get user's task lists
+        task_lists = tasks_svc.get_task_lists()
+
+        # Get tasks from each list
+        all_tasks = []
+        for task_list in task_lists:
+            tasks = tasks_svc.get_tasks(task_list['id'], max_results=50)
+            for task in tasks:
+                task['list_name'] = task_list['title']
+                all_tasks.append(task)
+
+        context = {
+            "request": request,
+            "authenticated": True,
+            "user": user,
+            "task_lists": task_lists,
+            "tasks": all_tasks,
+            "title": "Inbotic - My Tasks"
+        }
+
+        return templates.TemplateResponse("tasks.html", context)
+
+    except Exception as e:
+        logger.error(f"Error loading tasks: {e}")
+        return RedirectResponse(f"/?error=Error+loading+tasks", status_code=302)
+
+@app.get("/tasks/review", response_class=HTMLResponse)
+async def review_tasks(request: Request):
+    """Use LLM to review current user's tasks and produce a concise plan in markdown."""
+    user = get_current_user_from_session(request)
+    if not user:
+        return RedirectResponse("/login", status_code=302)
+
+    gmail_svc, tasks_svc = get_user_services(user["user_id"])
+    if not tasks_svc:
+        return RedirectResponse("/?error=Gmail+not+connected", status_code=302)
+
+    try:
+        task_lists = tasks_svc.get_task_lists()
+        collected = []
+        for tl in task_lists:
+            tasks = tasks_svc.get_tasks(tl['id'], max_results=100)
+            for t in tasks:
+                due = t.get('due')
+                if due:
+                    # Normalize to YYYY-MM-DD
+                    due = due.split('T')[0]
+                collected.append({
+                    "title": t.get('title'),
+                    "due": due,
+                    "list": tl.get('title'),
+                    "status": t.get('status')
+                })
+
+        md = LLMClient.review_tasks(collected)
+        context = {
+            "request": request,
+            "authenticated": True,
+            "user": user,
+            "markdown": md,
+            "title": "Inbotic - AI Task Review"
+        }
+        return templates.TemplateResponse("review.html", context)
+    except Exception as e:
+        logger.error(f"Error during LLM task review: {e}")
+        return RedirectResponse(f"/tasks?error=Error+reviewing+tasks", status_code=302)
+
+@app.get("/api/tasks/review")
+async def api_review_tasks(request: Request):
+    """API endpoint to get LLM task review in markdown"""
+    user = get_current_user_from_session(request)
+    if not user:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+
+    gmail_svc, tasks_svc = get_user_services(user["user_id"])
+    if not tasks_svc:
+        return JSONResponse({"error": "Gmail/Tasks not connected"}, status_code=400)
+
+    try:
+        task_lists = tasks_svc.get_task_lists()
+        collected = []
+        for tl in task_lists:
+            tasks = tasks_svc.get_tasks(tl['id'], max_results=100)
+            for t in tasks:
+                due = t.get('due')
+                if due:
+                    due = due.split('T')[0]
+                
+                # Extract Gmail link from notes if present
+                notes = t.get('notes', '')
+                link = None
+                if 'Link: https://mail.google.com' in notes:
+                    import re
+                    link_match = re.search(r'Link: (https://mail.google.com[^\s]+)', notes)
+                    if link_match:
+                        link = link_match.group(1)
+
+                collected.append({
+                    "title": t.get('title'),
+                    "due": due,
+                    "list": tl.get('title'),
+                    "status": t.get('status'),
+                    "link": link
+                })
+
+        logger.info(f"AI Review: Collected {len(collected)} tasks for review")
+        if collected:
+            logger.info(f"Sample task: {collected[0]}")
+        
+        md = LLMClient.review_tasks(collected)
+        
+        # Save chat history
+        db = SessionLocal()
+        try:
+            # Save user request (implicit)
+            user_msg = ChatHistory(
+                user_id=user["user_id"],
+                role="user",
+                content="Generate AI Task Review"
+            )
+            db.add(user_msg)
+            
+            # Save assistant response
+            ai_msg = ChatHistory(
+                user_id=user["user_id"],
+                role="assistant",
+                content=md
+            )
+            db.add(ai_msg)
+            db.commit()
+        except Exception as e:
+            logger.error(f"Failed to save chat history: {e}")
+        finally:
+            db.close()
+
+        return JSONResponse({"markdown": md})
+    except Exception as e:
+        logger.error(f"Error during API task review: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 # Removed Jinja2 routes: /, /emails, /profile to support React frontend
 # These paths should be handled by the frontend router, with data fetched from API endpoints.
@@ -603,7 +1270,7 @@ async def update_username(request: Request, new_username: str = Form(...)):
     """Allow a logged-in user to change their username"""
     user_session = get_current_user_from_session(request)
     if not user_session:
-        return RedirectResponse("/auth/gmail", status_code=302)
+        return RedirectResponse("/login", status_code=302)
 
     new_username = new_username.strip()
     # Basic validation
@@ -884,7 +1551,7 @@ async def debug_session(request: Request):
     <h1>Session Debug Info</h1>
     <pre>{debug_info}</pre>
     <p><a href="/">Go to Home</a></p>
-    <p><a href="/auth/gmail">Go to Login</a></p>
+    <p><a href="/login">Go to Login</a></p>
     """)
 
 if __name__ == "__main__":
@@ -917,7 +1584,7 @@ async def api_me(request: Request):
 @app.post("/api/logout")
 async def api_logout():
     resp = JSONResponse({"success": True})
-    resp.delete_cookie(key="session_id")
+    _delete_session_cookie(resp)
     return resp
 
 @app.get("/api/dashboard")
@@ -988,7 +1655,13 @@ async def api_register(
     response: Response,
     data: dict = Body(...)
 ):
-    return JSONResponse({"error": "Manual registration disabled. Please use Gmail login."}, status_code=401)
+    email = data.get("email")
+    username = data.get("username")
+    password = data.get("password")
+    confirm_password = data.get("confirm_password")
+
+    if password != confirm_password:
+        return JSONResponse({"error": "Passwords do not match"}, status_code=400)
 
     db = SessionLocal()
     try:
@@ -1012,13 +1685,7 @@ async def api_register(
         session_id = create_session(new_user.id, new_user.username, email)
         
         resp = JSONResponse({"success": True, "user": {"username": new_user.username, "email": new_user.email}})
-        resp.set_cookie(
-            key="session_id",
-            value=session_id,
-            max_age=86400,
-            httponly=True,
-            samesite="lax"
-        )
+        _set_session_cookie(resp, session_id)
         return resp
     finally:
         db.close()
@@ -1191,37 +1858,17 @@ async def api_tasks(request: Request, refresh: bool = False):
                     if task.get('due'):
                         try:
                             due_str = task.get('due')
+                            # Handle '2023-12-01T00:00:00.000Z' or '2023-12-01'
                             if 'T' in due_str:
                                 date_part, time_part = due_str.split('T', 1)
                                 due_date = datetime.strptime(date_part, "%Y-%m-%d")
-                                time_cleaned = time_part.replace('Z', '').split('.')[0]
-                                # If Google zeroed it out, try to recover from notes
-                                if time_cleaned == "00:00:00":
-                                    notes = task.get('notes', '')
-                                    # Look for "⏰ Time: HH:MM UTC"
-                                    time_match = re.search(r'⏰ Time: (\d{2}:\d{2})', notes)
-                                    if time_match:
-                                        due_time = f"{time_match.group(1)}:00"
-                                    else:
-                                        due_time = time_cleaned
-                                else:
-                                    due_time = time_cleaned
+                                # Extract time: "14:35:00.000Z" -> "14:35:00"
+                                time_cleaned = time_part.replace('Z', '').split('.')[0]  # Remove milliseconds/timezone
+                                due_time = time_cleaned
                             else:
                                 due_date = datetime.strptime(due_str, "%Y-%m-%d")
                         except Exception as e:
                             logger.debug(f"Failed to parse due date '{task.get('due')}': {e}")
-                    
-                    # Fallback check for time in notes even if due date is different
-                    if not due_time:
-                        notes = task.get('notes', '')
-                        time_match = re.search(r'⏰ Time: (\d{2}:\d{2})', notes)
-                        if time_match:
-                            due_time = f"{time_match.group(1)}:00"
-
-                    # Correctly set the recovered time back into the task object for the API response
-                    if due_time and task.get('due'):
-                         date_part = task['due'].split('T')[0]
-                         task['due'] = f"{date_part}T{due_time}.000Z"
 
                     new_task = Task(
                         user_id=user["user_id"],
@@ -1350,6 +1997,123 @@ async def api_profile(request: Request):
         db.close()
 
 @app.post("/api/chat/send")
-async def api_chat_send(request: Request):
-    """Disable chat entirely"""
-    return JSONResponse({"error": "AI Chat is disabled."}, status_code=404)
+async def api_chat_send(request: Request, chat_message: str = Form(...)):
+    user = get_current_user_from_session(request)
+    if not user:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+
+    gmail_svc, tasks_svc = get_user_services(user["user_id"])
+    message_lower = chat_message.lower()
+    
+    # Command: Mark task as done
+    if any(phrase in message_lower for phrase in ["mark", "complete", "done", "finish"]):
+        if tasks_svc:
+            try:
+                task_lists = tasks_svc.get_task_lists()
+                for tl in task_lists:
+                    tasks = tasks_svc.get_tasks(tl['id'], max_results=50)
+                    for t in tasks:
+                        task_title_lower = t.get('title', '').lower()
+                        # Check if the message mentions this task
+                        if any(word in message_lower for word in task_title_lower.split() if len(word) > 3):
+                            # Mark as completed
+                            tasks_svc.complete_task(tl['id'], t['id'])
+                            reply = f"✅ Marked task '{t.get('title')}' as complete!"
+                            
+                            # Save to history
+                            db = SessionLocal()
+                            try:
+                                db.add(ChatHistory(user_id=user["user_id"], role="user", content=chat_message))
+                                db.add(ChatHistory(user_id=user["user_id"], role="assistant", content=reply))
+                                db.commit()
+                            finally:
+                                db.close()
+                            return JSONResponse({"reply": reply})
+            except Exception as e:
+                logger.error(f"Error marking task complete: {e}")
+    
+    # Command: Search emails
+    if any(phrase in message_lower for phrase in ["search email", "find email", "email about", "emails about"]):
+        if gmail_svc:
+            try:
+                # Extract search terms
+                search_terms = message_lower.replace("search emails about", "").replace("search email about", "")
+                search_terms = search_terms.replace("find emails about", "").replace("find email about", "")
+                search_terms = search_terms.replace("emails about", "").replace("email about", "").strip()
+                
+                if search_terms:
+                    emails = gmail_svc.get_recent_emails(max_results=5, days_back=30, query=search_terms)
+                    if emails:
+                        reply = f"📧 Found {len(emails)} email(s) about '{search_terms}':\n\n"
+                        for e in emails:
+                            reply += f"• **{e.get('subject', 'No Subject')}** from {e.get('sender', 'Unknown')}\n"
+                        
+                        # Save to history
+                        db = SessionLocal()
+                        try:
+                            db.add(ChatHistory(user_id=user["user_id"], role="user", content=chat_message))
+                            db.add(ChatHistory(user_id=user["user_id"], role="assistant", content=reply))
+                            db.commit()
+                        finally:
+                            db.close()
+                        return JSONResponse({"reply": reply})
+                    else:
+                        reply = f"No emails found about '{search_terms}' in the last 30 days."
+                        db = SessionLocal()
+                        try:
+                            db.add(ChatHistory(user_id=user["user_id"], role="user", content=chat_message))
+                            db.add(ChatHistory(user_id=user["user_id"], role="assistant", content=reply))
+                            db.commit()
+                        finally:
+                            db.close()
+                        return JSONResponse({"reply": reply})
+            except Exception as e:
+                logger.error(f"Error searching emails: {e}")
+    
+    # Default: RAG-based response
+    context_parts = []
+    
+    # 1. Recent Emails
+    if gmail_svc:
+        try:
+            recent_emails = gmail_svc.get_recent_emails(max_results=10, days_back=7)
+            if recent_emails:
+                context_parts.append("Recent Emails:")
+                for e in recent_emails:
+                    context_parts.append(f"- From: {e.get('sender')}, Subject: {e.get('subject')}, Body Snippet: {e.get('snippet')}")
+        except Exception as e:
+            logger.error(f"Error fetching emails for chat: {e}")
+
+    # 2. Tasks
+    if tasks_svc:
+        try:
+            task_lists = tasks_svc.get_task_lists()
+            all_tasks = []
+            for tl in task_lists:
+                tasks = tasks_svc.get_tasks(tl['id'], max_results=20)
+                for t in tasks:
+                    all_tasks.append(f"- [{t.get('status')}] {t.get('title')} (Due: {t.get('due', 'None')})")
+            
+            if all_tasks:
+                context_parts.append("\nCurrent Tasks:")
+                context_parts.extend(all_tasks)
+        except Exception as e:
+            logger.error(f"Error fetching tasks for chat: {e}")
+
+    context_data = "\n".join(context_parts)
+    
+    # Generate Response
+    reply = LLMClient.chat_with_data(chat_message, context_data)
+
+    # Save History
+    db = SessionLocal()
+    try:
+        db.add(ChatHistory(user_id=user["user_id"], role="user", content=chat_message))
+        db.add(ChatHistory(user_id=user["user_id"], role="assistant", content=reply))
+        db.commit()
+    except Exception as e:
+        logger.error(f"Failed to save chat history: {e}")
+    finally:
+        db.close()
+
+    return JSONResponse({"reply": reply})

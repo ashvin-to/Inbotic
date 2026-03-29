@@ -8,8 +8,14 @@ const api = axios.create({
     },
 });
 
-// Add a request interceptor to handle API paths consistently
+// Add a request interceptor to handle session tokens and API paths
 api.interceptors.request.use(config => {
+    // Add session token to header for cross-domain auth support
+    const token = localStorage.getItem('session_id');
+    if (token) {
+        config.headers['Authorization'] = `Bearer ${token}`;
+    }
+
     // Only add /api prefix if the URL doesn't already have it
     if (config.url && !config.url.startsWith('/api/') && !config.url.startsWith('http')) {
         config.url = `/api${config.url.startsWith('/') ? '' : '/'}${config.url}`;
