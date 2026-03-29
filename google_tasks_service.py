@@ -417,8 +417,8 @@ class GoogleTasksService:
             r'register\s+by|registration\s+closes?|closing\s+date|'
             r'last\s+date|before|until|no\s+later\s+than|not\s+after|'
             r'starts?\s+on|begins?\s+on|scheduled\s+for|held\s+on|takes\s+place\s+on|'
-            r'expires?|ends?|assessment|exam|test|quiz|assignment|project|submission|'
-            r'meeting|event|class|workshop|seminar|conference'
+            r'expires?|ends?|assessment|exam|test|quiz|assignment|project|submission|deadline|'
+            r'meeting|event|class|workshop|seminar|conference|webinar|interview|presentation|call|demo|launch|release|go\s+live|'
             r')\b',
             re.IGNORECASE,
         )

@@ -17,7 +17,7 @@ import asyncio
 from pathlib import Path
 from dotenv import load_dotenv
 
-from fastapi import FastAPI, Request, HTTPException, Depends, Form, Cookie, Response, Body, File, UploadFile
+from fastapi import FastAPI, Request, HTTPException, Depends, Form, Cookie, Response, Body, File, UploadFile, Header
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -496,7 +496,7 @@ def _process_user_emails_once(
     return {"processed": processed_count, "total": len(emails)}
 
 
-def _run_auto_process_once():
+def _run_auto_process_once() -> Dict[str, int]:
     """Process new emails for all connected users once."""
     days_back = int(os.getenv("INBOTIC_AUTO_PROCESS_DAYS_BACK", "1"))
     max_emails = int(os.getenv("INBOTIC_AUTO_PROCESS_MAX_EMAILS", "20"))
@@ -507,7 +507,7 @@ def _run_auto_process_once():
     users = _list_users_with_gmail_tokens()
     if not users:
         logger.info("Auto process: no users with Gmail tokens found")
-        return
+        return {"users": 0, "emails_scanned": 0, "emails_created": 0}
 
     total_users = 0
     total_emails = 0
@@ -529,6 +529,29 @@ def _run_auto_process_once():
     logger.info(
         f"Auto process done: users={total_users}, emails_scanned={total_emails}, emails_created={total_created}"
     )
+    return {"users": total_users, "emails_scanned": total_emails, "emails_created": total_created}
+
+
+@app.post("/api/auto-process/run")
+async def api_auto_process_run(x_auto_process_key: Optional[str] = Header(default=None)):
+    """Run one new-mail processing pass for all connected users (for cron/scheduler use)."""
+    expected_key = (os.getenv("INBOTIC_AUTO_PROCESS_API_KEY") or "").strip()
+    if not expected_key:
+        return JSONResponse(
+            {"error": "Auto-process API key is not configured"},
+            status_code=503,
+        )
+
+    provided_key = (x_auto_process_key or "").strip()
+    if not provided_key or provided_key != expected_key:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    try:
+        result = await asyncio.to_thread(_run_auto_process_once)
+        return JSONResponse({"success": True, "result": result})
+    except Exception as e:
+        logger.error(f"Auto process manual run failed: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 async def _auto_process_loop():

@@ -151,6 +151,30 @@ Optional hardening:
 
 - Set `OAUTH_STATE_SECRET` to a long random value for signed OAuth state verification.
 
+### Automatic new-email processing
+
+The backend includes automatic new-mail polling support.
+
+Enable in-process polling (only works while service is awake):
+
+- `INBOTIC_AUTO_PROCESS_NEW_MAIL=true`
+- `INBOTIC_AUTO_PROCESS_INTERVAL_SECONDS=120`
+- `INBOTIC_AUTO_PROCESS_DAYS_BACK=1`
+- `INBOTIC_AUTO_PROCESS_MAX_EMAILS=20`
+- `INBOTIC_AUTO_PROCESS_MAX_DAYS_AHEAD=60`
+
+For Render sleeping instances, use a scheduler/cron trigger instead:
+
+1. Set `INBOTIC_AUTO_PROCESS_API_KEY` on backend.
+2. Create a cron job that calls:
+
+```bash
+curl -X POST https://inbiotic.onrender.com/api/auto-process/run \
+   -H "X-Auto-Process-Key: <INBOTIC_AUTO_PROCESS_API_KEY>"
+```
+
+This runs one processing pass each time and is the most reliable option on free/sleeping plans.
+
 ## API docs
 
 When backend is running, FastAPI docs are available at:
