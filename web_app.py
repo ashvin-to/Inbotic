@@ -32,12 +32,11 @@ from slowapi.middleware import SlowAPIMiddleware
 load_dotenv()
 
 # Import our services
-from database import get_db, create_tables, SessionLocal, User, Email, Task, GmailToken, ChatHistory
+from database import get_db, create_tables, SessionLocal, User, Email, Task, GmailToken
 from user_service import create_user, authenticate_user, get_user_by_username, save_gmail_token, get_gmail_token
 from auth import create_access_token, verify_token, get_password_hash
 from gmail_service import GmailService
 from google_tasks_service import GoogleTasksService
-from llm_features.llm_client import LLMClient
 from google_oauth_config import resolve_google_oauth_client_config
 import pickle
 import smtplib
@@ -577,7 +576,6 @@ async def shutdown_auto_process():
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
     """Home page - Gmail-first approach"""
-    session_id = request.cookies.get("session_id")
     user = get_current_user_from_session(request)
     context = {
         "request": request,
@@ -587,9 +585,6 @@ async def home(request: Request):
     if user:
         # User is logged in - show dashboard
         gmail_svc, tasks_svc = get_user_services(user["user_id"])
-        # Include LLM chat history in context
-        if session_id and session_id in sessions:
-            context["chat_messages"] = sessions[session_id].get("chat", [])
 
         if gmail_svc and tasks_svc:
             try:
@@ -654,93 +649,6 @@ async def home(request: Request):
         context["oauth_manual_allowed"] = _manual_oauth_allowed()
 
     return templates.TemplateResponse("index.html", context)
-
-@app.post("/chat/send")
-@app.post("/api/chat/send")
-async def chat_send(request: Request, prompt: str = Form(None), chat_message: str = Form(None)):
-    """LLM chat endpoint; stores conversation in in-memory session and redirects to home."""
-    session_id = request.cookies.get("session_id")
-    if not session_id or session_id not in sessions:
-        return RedirectResponse("/login", status_code=302)
-
-    # Initialize history
-    history = sessions[session_id].setdefault("chat", [])
-
-    # Build messages for LLM from history (capped length) with a guiding system prompt
-    messages = []
-
-    # Try to enrich with user context (recent emails and upcoming tasks)
-    context_lines = []
-    try:
-        user = get_current_user_from_session(request)
-        gmail_svc, tasks_svc = get_user_services(user["user_id"]) if user else (None, None)
-        if gmail_svc:
-            # Try strict: unread + inbox, last 1 day; then relax
-            emails = gmail_svc.get_recent_emails(max_results=5, days_back=1, unread_only=True, inbox_only=True)
-            if not emails:
-                emails = gmail_svc.get_recent_emails(max_results=5, days_back=3, unread_only=False, inbox_only=True)
-            if not emails:
-                emails = gmail_svc.get_recent_emails(max_results=5, days_back=7, unread_only=False, inbox_only=False)
-            if emails:
-                context_lines.append("RecentEmails:")
-                for e in emails:
-                    subj = (e.get('subject') or 'No Subject')
-                    context_lines.append(f"- {subj[:120]}")
-        if tasks_svc:
-            lists = tasks_svc.get_task_lists()
-            upcoming = []
-            from datetime import datetime as _dt
-            for tl in lists:
-                for t in tasks_svc.get_tasks(tl['id'], max_results=50):
-                    due = t.get('due')
-                    if due:
-                        try:
-                            d = _dt.strptime(due[:10], '%Y-%m-%d').date()
-                            upcoming.append((d, tl.get('title'), t.get('title')))
-                        except Exception:
-                            pass
-            if upcoming:
-                upcoming.sort(key=lambda x: x[0])
-                context_lines.append("UpcomingTasks:")
-                for d, lst, title in upcoming[:10]:
-                    context_lines.append(f"- {d.isoformat()} · {lst}: {title[:100]}")
-    except Exception as _:
-        pass
-
-    system_content = (
-        "You are the Inbotic assistant. Be concise and helpful. "
-        "Use the provided context about the user's emails and tasks when relevant.\n" +
-        ("\n".join(context_lines) if context_lines else "")
-    )
-    messages.append({"role": "system", "content": system_content})
-    # Stateless chat: do NOT include previous turns in the prompt
-    # Prefer chat_message (new UI) but fall back to prompt (back-compat)
-    user_text = chat_message if chat_message is not None else (prompt or "")
-    messages.append({"role": "user", "content": user_text})
-
-    try:
-        reply = LLMClient._chat_complete(messages=messages, temperature=0.5, max_tokens=600)
-    except Exception as e:
-        reply = f"Sorry, the assistant is unavailable right now. ({e})"
-
-    # Sanitize odd special tokens and whitespace from reply
-    try:
-        import re as _re
-        reply_clean = _re.sub(r"</?s>", "", reply).strip()
-        reply = reply_clean or "(No response generated)"
-    except Exception:
-        reply = reply.strip() or "(No response generated)"
-
-    # Save back to session
-    history.append({"role": "user", "content": user_text})
-    history.append({"role": "assistant", "content": reply})
-    sessions[session_id]["chat"] = history
-
-    sessions[session_id]["chat"] = history
-
-    if "application/json" in request.headers.get("accept", ""):
-        return JSONResponse({"reply": reply, "history": history})
-    return RedirectResponse("/", status_code=302)
 
 @app.get("/auth/gmail")
 async def auth_gmail(request: Request, mode: str = None):
@@ -1146,120 +1054,6 @@ async def view_tasks(request: Request):
     except Exception as e:
         logger.error(f"Error loading tasks: {e}")
         return RedirectResponse(f"/?error=Error+loading+tasks", status_code=302)
-
-@app.get("/tasks/review", response_class=HTMLResponse)
-async def review_tasks(request: Request):
-    """Use LLM to review current user's tasks and produce a concise plan in markdown."""
-    user = get_current_user_from_session(request)
-    if not user:
-        return RedirectResponse("/login", status_code=302)
-
-    gmail_svc, tasks_svc = get_user_services(user["user_id"])
-    if not tasks_svc:
-        return RedirectResponse("/?error=Gmail+not+connected", status_code=302)
-
-    try:
-        task_lists = tasks_svc.get_task_lists()
-        collected = []
-        for tl in task_lists:
-            tasks = tasks_svc.get_tasks(tl['id'], max_results=100)
-            for t in tasks:
-                due = t.get('due')
-                if due:
-                    # Normalize to YYYY-MM-DD
-                    due = due.split('T')[0]
-                collected.append({
-                    "title": t.get('title'),
-                    "due": due,
-                    "list": tl.get('title'),
-                    "status": t.get('status')
-                })
-
-        md = LLMClient.review_tasks(collected)
-        context = {
-            "request": request,
-            "authenticated": True,
-            "user": user,
-            "markdown": md,
-            "title": "Inbotic - AI Task Review"
-        }
-        return templates.TemplateResponse("review.html", context)
-    except Exception as e:
-        logger.error(f"Error during LLM task review: {e}")
-        return RedirectResponse(f"/tasks?error=Error+reviewing+tasks", status_code=302)
-
-@app.get("/api/tasks/review")
-async def api_review_tasks(request: Request):
-    """API endpoint to get LLM task review in markdown"""
-    user = get_current_user_from_session(request)
-    if not user:
-        return JSONResponse({"error": "Not authenticated"}, status_code=401)
-
-    gmail_svc, tasks_svc = get_user_services(user["user_id"])
-    if not tasks_svc:
-        return JSONResponse({"error": "Gmail/Tasks not connected"}, status_code=400)
-
-    try:
-        task_lists = tasks_svc.get_task_lists()
-        collected = []
-        for tl in task_lists:
-            tasks = tasks_svc.get_tasks(tl['id'], max_results=100)
-            for t in tasks:
-                due = t.get('due')
-                if due:
-                    due = due.split('T')[0]
-                
-                # Extract Gmail link from notes if present
-                notes = t.get('notes', '')
-                link = None
-                if 'Link: https://mail.google.com' in notes:
-                    import re
-                    link_match = re.search(r'Link: (https://mail.google.com[^\s]+)', notes)
-                    if link_match:
-                        link = link_match.group(1)
-
-                collected.append({
-                    "title": t.get('title'),
-                    "due": due,
-                    "list": tl.get('title'),
-                    "status": t.get('status'),
-                    "link": link
-                })
-
-        logger.info(f"AI Review: Collected {len(collected)} tasks for review")
-        if collected:
-            logger.info(f"Sample task: {collected[0]}")
-        
-        md = LLMClient.review_tasks(collected)
-        
-        # Save chat history
-        db = SessionLocal()
-        try:
-            # Save user request (implicit)
-            user_msg = ChatHistory(
-                user_id=user["user_id"],
-                role="user",
-                content="Generate AI Task Review"
-            )
-            db.add(user_msg)
-            
-            # Save assistant response
-            ai_msg = ChatHistory(
-                user_id=user["user_id"],
-                role="assistant",
-                content=md
-            )
-            db.add(ai_msg)
-            db.commit()
-        except Exception as e:
-            logger.error(f"Failed to save chat history: {e}")
-        finally:
-            db.close()
-
-        return JSONResponse({"markdown": md})
-    except Exception as e:
-        logger.error(f"Error during API task review: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
 
 # Removed Jinja2 routes: /, /emails, /profile to support React frontend
 # These paths should be handled by the frontend router, with data fetched from API endpoints.
@@ -1996,124 +1790,3 @@ async def api_profile(request: Request):
     finally:
         db.close()
 
-@app.post("/api/chat/send")
-async def api_chat_send(request: Request, chat_message: str = Form(...)):
-    user = get_current_user_from_session(request)
-    if not user:
-        return JSONResponse({"error": "Not authenticated"}, status_code=401)
-
-    gmail_svc, tasks_svc = get_user_services(user["user_id"])
-    message_lower = chat_message.lower()
-    
-    # Command: Mark task as done
-    if any(phrase in message_lower for phrase in ["mark", "complete", "done", "finish"]):
-        if tasks_svc:
-            try:
-                task_lists = tasks_svc.get_task_lists()
-                for tl in task_lists:
-                    tasks = tasks_svc.get_tasks(tl['id'], max_results=50)
-                    for t in tasks:
-                        task_title_lower = t.get('title', '').lower()
-                        # Check if the message mentions this task
-                        if any(word in message_lower for word in task_title_lower.split() if len(word) > 3):
-                            # Mark as completed
-                            tasks_svc.complete_task(tl['id'], t['id'])
-                            reply = f"✅ Marked task '{t.get('title')}' as complete!"
-                            
-                            # Save to history
-                            db = SessionLocal()
-                            try:
-                                db.add(ChatHistory(user_id=user["user_id"], role="user", content=chat_message))
-                                db.add(ChatHistory(user_id=user["user_id"], role="assistant", content=reply))
-                                db.commit()
-                            finally:
-                                db.close()
-                            return JSONResponse({"reply": reply})
-            except Exception as e:
-                logger.error(f"Error marking task complete: {e}")
-    
-    # Command: Search emails
-    if any(phrase in message_lower for phrase in ["search email", "find email", "email about", "emails about"]):
-        if gmail_svc:
-            try:
-                # Extract search terms
-                search_terms = message_lower.replace("search emails about", "").replace("search email about", "")
-                search_terms = search_terms.replace("find emails about", "").replace("find email about", "")
-                search_terms = search_terms.replace("emails about", "").replace("email about", "").strip()
-                
-                if search_terms:
-                    emails = gmail_svc.get_recent_emails(max_results=5, days_back=30, query=search_terms)
-                    if emails:
-                        reply = f"📧 Found {len(emails)} email(s) about '{search_terms}':\n\n"
-                        for e in emails:
-                            reply += f"• **{e.get('subject', 'No Subject')}** from {e.get('sender', 'Unknown')}\n"
-                        
-                        # Save to history
-                        db = SessionLocal()
-                        try:
-                            db.add(ChatHistory(user_id=user["user_id"], role="user", content=chat_message))
-                            db.add(ChatHistory(user_id=user["user_id"], role="assistant", content=reply))
-                            db.commit()
-                        finally:
-                            db.close()
-                        return JSONResponse({"reply": reply})
-                    else:
-                        reply = f"No emails found about '{search_terms}' in the last 30 days."
-                        db = SessionLocal()
-                        try:
-                            db.add(ChatHistory(user_id=user["user_id"], role="user", content=chat_message))
-                            db.add(ChatHistory(user_id=user["user_id"], role="assistant", content=reply))
-                            db.commit()
-                        finally:
-                            db.close()
-                        return JSONResponse({"reply": reply})
-            except Exception as e:
-                logger.error(f"Error searching emails: {e}")
-    
-    # Default: RAG-based response
-    context_parts = []
-    
-    # 1. Recent Emails
-    if gmail_svc:
-        try:
-            recent_emails = gmail_svc.get_recent_emails(max_results=10, days_back=7)
-            if recent_emails:
-                context_parts.append("Recent Emails:")
-                for e in recent_emails:
-                    context_parts.append(f"- From: {e.get('sender')}, Subject: {e.get('subject')}, Body Snippet: {e.get('snippet')}")
-        except Exception as e:
-            logger.error(f"Error fetching emails for chat: {e}")
-
-    # 2. Tasks
-    if tasks_svc:
-        try:
-            task_lists = tasks_svc.get_task_lists()
-            all_tasks = []
-            for tl in task_lists:
-                tasks = tasks_svc.get_tasks(tl['id'], max_results=20)
-                for t in tasks:
-                    all_tasks.append(f"- [{t.get('status')}] {t.get('title')} (Due: {t.get('due', 'None')})")
-            
-            if all_tasks:
-                context_parts.append("\nCurrent Tasks:")
-                context_parts.extend(all_tasks)
-        except Exception as e:
-            logger.error(f"Error fetching tasks for chat: {e}")
-
-    context_data = "\n".join(context_parts)
-    
-    # Generate Response
-    reply = LLMClient.chat_with_data(chat_message, context_data)
-
-    # Save History
-    db = SessionLocal()
-    try:
-        db.add(ChatHistory(user_id=user["user_id"], role="user", content=chat_message))
-        db.add(ChatHistory(user_id=user["user_id"], role="assistant", content=reply))
-        db.commit()
-    except Exception as e:
-        logger.error(f"Failed to save chat history: {e}")
-    finally:
-        db.close()
-
-    return JSONResponse({"reply": reply})

@@ -1,6 +1,6 @@
 # Inbotic
 
-Inbotic turns important Gmail messages into actionable Google Tasks through a multi-user web app with optional AI-assisted chat context.
+Inbotic turns important Gmail messages into actionable Google Tasks through a multi-user web app.
 
 ## Tech stack
 
@@ -14,7 +14,7 @@ Inbotic turns important Gmail messages into actionable Google Tasks through a mu
 - FastAPI backend with authentication, rate-limiting, and Gmail/Google Tasks integration
 - Server-rendered web interface (FastAPI + Jinja templates)
 - React frontend implementation for modern client-side UI
-- Email parsing and task creation workflow with LLM-assisted features
+- Email parsing and task creation workflow
 - SQLite-backed user/task/email persistence
 
 ## Interface options (both kept intentionally)
@@ -162,7 +162,6 @@ When backend is running, FastAPI docs are available at:
 - `database.py` - database models/session setup
 - `auth.py` - auth/token helpers
 - `gmail_service.py` / `google_tasks_service.py` - Google integrations
-- `llm_features/` - LLM-related integration utilities
 - `templates/` - backend-rendered pages
 - `frontend/` - React app
 - `scripts/` - maintenance and migration utilities
