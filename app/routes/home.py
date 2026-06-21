@@ -114,4 +114,9 @@ async def api_auto_process_run(x_auto_process_key: str = Header(default=None)):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@router.get("/health")
+async def health():
+    return JSONResponse({"status": "ok"})
+
+
 
