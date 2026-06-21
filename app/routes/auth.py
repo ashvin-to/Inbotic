@@ -205,18 +205,18 @@ async def api_auth_gmail_token(request: Request, data: dict = Body(...)):
     if not access_token:
         return JSONResponse({"error": "Missing access_token"}, status_code=400)
 
-    # Verify the token with Google
+    # Verify the token with Google's userinfo endpoint
     try:
         resp = requests.get(
-            "https://www.googleapis.com/oauth2/v3/tokeninfo",
-            params={"access_token": access_token},
+            "https://www.googleapis.com/oauth2/v3/userinfo",
+            headers={"Authorization": f"Bearer {access_token}"},
             timeout=10,
         )
         if resp.status_code != 200:
             logger.warning(f"Token verification failed: {resp.status_code} {resp.text}")
             return JSONResponse({"error": "Invalid access token"}, status_code=401)
-        token_info = resp.json()
-        email = token_info.get("email")
+        user_info = resp.json()
+        email = user_info.get("email")
         if not email:
             return JSONResponse({"error": "No email in token"}, status_code=401)
     except requests.RequestException as e:
