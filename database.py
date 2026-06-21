@@ -84,6 +84,7 @@ class Task(Base):
     gmail_token_id = Column(Integer, ForeignKey("gmail_tokens.id"), nullable=True, index=True)
     email_id = Column(Integer, ForeignKey("emails.id"), nullable=True)
     gmail_task_list_id = Column(String)
+    gmail_task_list_name = Column(String)
     gmail_task_id = Column(String)
     title = Column(String, nullable=False)
     description = Column(Text, nullable=True)
@@ -107,6 +108,7 @@ def create_tables():
             "ALTER TABLE gmail_tokens ADD COLUMN email_account VARCHAR",
             "ALTER TABLE emails ADD COLUMN gmail_token_id INTEGER REFERENCES gmail_tokens(id)",
             "ALTER TABLE tasks ADD COLUMN gmail_token_id INTEGER REFERENCES gmail_tokens(id)",
+            "ALTER TABLE tasks ADD COLUMN gmail_task_list_name VARCHAR",
         ):
             try:
                 conn.execute(text(sql))
