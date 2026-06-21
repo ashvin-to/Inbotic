@@ -1,7 +1,7 @@
 """
 Database models for Inbotic with multi-user support
 """
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, Boolean, JSON, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, Boolean, JSON, ForeignKey, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime
@@ -36,12 +36,12 @@ class User(Base):
     emails = relationship("Email", back_populates="user", cascade="all, delete-orphan")
     tasks = relationship("Task", back_populates="user", cascade="all, delete-orphan")
     gmail_tokens = relationship("GmailToken", back_populates="user", cascade="all, delete-orphan")
-
 class GmailToken(Base):
     __tablename__ = "gmail_tokens"
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    email_account = Column(String, nullable=True, index=True)
     access_token = Column(Text, nullable=False)
     refresh_token = Column(Text)
     token_type = Column(String, default="Bearer")
@@ -51,12 +51,16 @@ class GmailToken(Base):
 
     # Relationships
     user = relationship("User", back_populates="gmail_tokens")
+    emails = relationship("Email", back_populates="gmail_token", cascade="all, delete-orphan")
+    tasks = relationship("Task", back_populates="gmail_token", cascade="all, delete-orphan")
+
 
 class Email(Base):
     __tablename__ = "emails"
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    gmail_token_id = Column(Integer, ForeignKey("gmail_tokens.id"), nullable=True, index=True)
     gmail_message_id = Column(String, index=True)
     subject = Column(String, nullable=False)
     sender = Column(String, nullable=False)
@@ -68,13 +72,16 @@ class Email(Base):
 
     # Relationships
     user = relationship("User", back_populates="emails")
+    gmail_token = relationship("GmailToken", back_populates="emails")
     tasks = relationship("Task", back_populates="email", cascade="all, delete-orphan")
+
 
 class Task(Base):
     __tablename__ = "tasks"
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    gmail_token_id = Column(Integer, ForeignKey("gmail_tokens.id"), nullable=True, index=True)
     email_id = Column(Integer, ForeignKey("emails.id"), nullable=True)
     gmail_task_list_id = Column(String)
     gmail_task_id = Column(String)
@@ -89,11 +96,23 @@ class Task(Base):
 
     # Relationships
     user = relationship("User", back_populates="tasks")
+    gmail_token = relationship("GmailToken", back_populates="tasks")
     email = relationship("Email", back_populates="tasks")
-
 # Create tables
 def create_tables():
     Base.metadata.create_all(bind=engine)
+    # Migrate existing databases: add new columns if they don't exist
+    with engine.connect() as conn:
+        for sql in (
+            "ALTER TABLE gmail_tokens ADD COLUMN email_account VARCHAR",
+            "ALTER TABLE emails ADD COLUMN gmail_token_id INTEGER REFERENCES gmail_tokens(id)",
+            "ALTER TABLE tasks ADD COLUMN gmail_token_id INTEGER REFERENCES gmail_tokens(id)",
+        ):
+            try:
+                conn.execute(text(sql))
+                conn.commit()
+            except Exception:
+                pass  # column already exists
 
 def get_db():
     db = SessionLocal()
