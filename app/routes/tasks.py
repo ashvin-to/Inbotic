@@ -77,32 +77,32 @@ async def api_tasks(request: Request, refresh: bool = False):
                         task_lists = tasks_svc.get_task_lists()
                         for tl in task_lists:
                             for task in tasks_svc.get_tasks(tl['id'], max_results=50):
-                            task['list_name'] = tl['title']
-                            task['list_id'] = tl['id']
-                            task['account_email'] = account_email
-                            all_tasks.append(task)
-                            due_date = None
-                            due_time = None
-                            if task.get('due'):
-                                try:
-                                    ds = task['due']
-                                    if 'T' in ds:
-                                        dp, tp = ds.split('T', 1)
-                                        due_date = datetime.strptime(dp, "%Y-%m-%d")
-                                        due_time = tp.replace('Z', '').split('.')[0]
-                                    else:
-                                        due_date = datetime.strptime(ds, "%Y-%m-%d")
-                                except Exception as e:
-                                    logger.debug(f"Failed to parse due '{task.get('due')}': {e}")
-                            db.add(Task(
-                                user_id=user["user_id"], gmail_token_id=token_id,
-                                gmail_task_id=task['id'], gmail_task_list_id=tl['id'],
-                                gmail_task_list_name=tl['title'],
-                                title=task.get('title', 'Untitled'),
-                                description=task.get('notes', ''),
-                                status=task.get('status', 'needsAction'),
-                                due_date=due_date, due_time=due_time,
-                            ))
+                                task['list_name'] = tl['title']
+                                task['list_id'] = tl['id']
+                                task['account_email'] = account_email
+                                all_tasks.append(task)
+                                due_date = None
+                                due_time = None
+                                if task.get('due'):
+                                    try:
+                                        ds = task['due']
+                                        if 'T' in ds:
+                                            dp, tp = ds.split('T', 1)
+                                            due_date = datetime.strptime(dp, "%Y-%m-%d")
+                                            due_time = tp.replace('Z', '').split('.')[0]
+                                        else:
+                                            due_date = datetime.strptime(ds, "%Y-%m-%d")
+                                    except Exception as e:
+                                        logger.debug(f"Failed to parse due '{task.get('due')}': {e}")
+                                db.add(Task(
+                                    user_id=user["user_id"], gmail_token_id=token_id,
+                                    gmail_task_id=task['id'], gmail_task_list_id=tl['id'],
+                                    gmail_task_list_name=tl['title'],
+                                    title=task.get('title', 'Untitled'),
+                                    description=task.get('notes', ''),
+                                    status=task.get('status', 'needsAction'),
+                                    due_date=due_date, due_time=due_time,
+                                ))
                     except Exception as e:
                         logger.error(f"Error fetching tasks for {account_email}: {e}")
             db.commit()
