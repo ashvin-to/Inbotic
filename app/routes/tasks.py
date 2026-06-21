@@ -76,7 +76,7 @@ async def api_tasks(request: Request, refresh: bool = False):
                     try:
                         task_lists = tasks_svc.get_task_lists()
                         for tl in task_lists:
-                        for task in tasks_svc.get_tasks(tl['id'], max_results=50):
+                            for task in tasks_svc.get_tasks(tl['id'], max_results=50):
                             task['list_name'] = tl['title']
                             task['list_id'] = tl['id']
                             task['account_email'] = account_email
