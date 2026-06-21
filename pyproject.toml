@@ -1,0 +1,29 @@
+[project]
+name = "inbotic"
+version = "3.0.0"
+description = "Gmail-first multi-user web interface for email to tasks automation"
+requires-python = ">=3.10"
+
+[tool.ruff]
+line-length = 140
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "ARG"]
+
+[tool.ruff.format]
+quote-style = "single"
+
+[tool.mypy]
+python_version = "3.10"
+warn_unused_configs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_return_any = true
+warn_unreachable = true
+strict_equality = true
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["google.*", "slowapi.*", "requests", "dotenv"]
+ignore_missing_imports = true
