@@ -75,8 +75,7 @@ async def api_tasks(request: Request, refresh: bool = False):
                 if tasks_svc:
                     try:
                         task_lists = tasks_svc.get_task_lists()
-                    tasks_svc: tasks_svc
-                    for tl in task_lists:
+                        for tl in task_lists:
                         for task in tasks_svc.get_tasks(tl['id'], max_results=50):
                             task['list_name'] = tl['title']
                             task['list_id'] = tl['id']

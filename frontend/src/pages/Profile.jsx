@@ -12,14 +12,21 @@ const Profile = () => {
     // Form states
     const [isEditingUsername, setIsEditingUsername] = useState(false);
     const [newUsername, setNewUsername] = useState('');
-    const [passwordForm, setPasswordForm] = useState({
-        new_password: '',
-        confirm_password: ''
-    });
+    const [accounts, setAccounts] = useState([]);
 
     useEffect(() => {
         fetchProfile();
+        fetchAccounts();
     }, []);
+
+    const fetchAccounts = async () => {
+        try {
+            const response = await api.get('/auth/accounts');
+            setAccounts(response.data.accounts || []);
+        } catch (e) {
+            // ignore
+        }
+    };
 
     const fetchProfile = async () => {
         try {
@@ -143,33 +150,6 @@ const Profile = () => {
         } catch (err) {
             console.error(err);
             setError("Failed to update username");
-            setTimeout(() => setError(null), 3000);
-        }
-    };
-
-    const handleUpdatePassword = async (e) => {
-        e.preventDefault();
-        if (passwordForm.new_password !== passwordForm.confirm_password) {
-            setError("Passwords do not match");
-            return;
-        }
-
-        const formData = new FormData();
-        formData.append('new_password', passwordForm.new_password);
-        formData.append('confirm_password', passwordForm.confirm_password);
-
-        try {
-            await api.post('/profile/update-password', formData, {
-                headers: {
-                    'Accept': 'application/json'
-                }
-            });
-            setPasswordForm({ new_password: '', confirm_password: '' });
-            setMessage("Password updated successfully");
-            setTimeout(() => setMessage(null), 3000);
-        } catch (err) {
-            console.error(err);
-            setError("Failed to update password");
             setTimeout(() => setError(null), 3000);
         }
     };
@@ -315,65 +295,34 @@ const Profile = () => {
                         )}
                     </div>
 
-                    {/* Update Password */}
+                    {/* Connected Accounts */}
                     <div className="bg-white dark:bg-gray-800 shadow rounded-lg p-6">
-                        <h3 className="text-lg font-medium leading-6 text-gray-900 dark:text-white mb-4">Security</h3>
-                        <form onSubmit={handleUpdatePassword} className="space-y-4">
-                            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                                <div>
-                                    <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">New Password</label>
-                                    <input
-                                        type="password"
-                                        value={passwordForm.new_password}
-                                        onChange={(e) => setPasswordForm({ ...passwordForm, new_password: e.target.value })}
-                                        className="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 dark:bg-gray-700 dark:text-white focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm border p-2"
-                                        required
-                                        minLength={6}
-                                    />
-                                </div>
-                                <div>
-                                    <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">Confirm Password</label>
-                                    <input
-                                        type="password"
-                                        value={passwordForm.confirm_password}
-                                        onChange={(e) => setPasswordForm({ ...passwordForm, confirm_password: e.target.value })}
-                                        className="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 dark:bg-gray-700 dark:text-white focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm border p-2"
-                                        required
-                                        minLength={6}
-                                    />
-                                </div>
-                            </div>
-                            <div className="flex justify-end">
-                                <button
-                                    type="submit"
-                                    className="inline-flex justify-center py-2 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-colors"
-                                >
-                                    Update Password
-                                </button>
-                            </div>
-                        </form>
-                    </div>
-
-                    {/* Account Status */}
-                    <div className="bg-white dark:bg-gray-800 shadow rounded-lg p-6">
-                        <h3 className="text-lg font-medium leading-6 text-gray-900 dark:text-white mb-4">Account Status</h3>
-                        <div className="flex items-center justify-between">
-                            <div>
-                                <p className="text-sm font-medium text-gray-700 dark:text-gray-300">Gmail Connection</p>
-                                <p className="text-xs text-gray-500 dark:text-gray-400">
-                                    {profile.gmail_tokens_connected ? 'Connected and active.' : 'Not connected.'}
-                                </p>
-                            </div>
-                            {profile.gmail_tokens_connected ? (
-                                <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300">
-                                    Active
-                                </span>
-                            ) : (
-                                <a href={`${import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'}/auth/gmail`} className="inline-flex items-center px-3 py-1.5 border border-transparent text-xs font-medium rounded text-indigo-700 bg-indigo-100 hover:bg-indigo-200 dark:bg-indigo-900/30 dark:text-indigo-300 dark:hover:bg-indigo-900/50 transition-colors">
-                                    Connect
-                                </a>
-                            )}
+                        <div className="flex items-center justify-between mb-4">
+                            <h3 className="text-lg font-medium leading-6 text-gray-900 dark:text-white">Connected Accounts</h3>
+                            <a
+                                href={`${import.meta.env.VITE_API_BASE_URL || ''}/auth/gmail`}
+                                className="inline-flex items-center px-3 py-1.5 border border-transparent text-xs font-medium rounded text-indigo-700 bg-indigo-100 hover:bg-indigo-200 dark:bg-indigo-900/30 dark:text-indigo-300 dark:hover:bg-indigo-900/50 transition-colors"
+                            >
+                                + Add Account
+                            </a>
                         </div>
+                        {accounts.length === 0 ? (
+                            <p className="text-sm text-gray-500 dark:text-gray-400">No accounts connected.</p>
+                        ) : (
+                            <div className="space-y-2">
+                                {accounts.map((acc) => (
+                                    <div key={acc.id} className="flex items-center justify-between py-2 border-b border-gray-100 dark:border-gray-700 last:border-0">
+                                        <div className="flex items-center gap-2">
+                                            <span className="w-2 h-2 rounded-full bg-green-500"></span>
+                                            <span className="text-sm text-gray-900 dark:text-white">{acc.email}</span>
+                                        </div>
+                                        <span className="text-xs text-gray-500 dark:text-gray-400">
+                                            {acc.created_at ? new Date(acc.created_at).toLocaleDateString() : ''}
+                                        </span>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
                     </div>
                 </div>
             </div>

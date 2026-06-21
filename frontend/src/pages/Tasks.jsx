@@ -259,6 +259,11 @@ const Tasks = () => {
                                                             {task.notes.length > 150 ? `${task.notes.substring(0, 150)}...` : task.notes}
                                                         </p>
                                                     )}
+                                                    {task.account_email && (
+                                                        <p className="text-xs text-gray-400 dark:text-gray-500 ml-7 mb-1">
+                                                            {task.account_email}
+                                                        </p>
+                                                    )}
                                                     <div className="ml-7 flex flex-wrap items-center gap-2 text-xs">
                                                         <span className="flex items-center text-orange-700 dark:text-orange-300 bg-orange-100/80 dark:bg-orange-900/30 px-2 py-1 rounded-full">
                                                             <svg className="w-3 h-3 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg>

@@ -156,6 +156,11 @@ const Emails = () => {
                                             <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
                                                 {formatSender(email.sender)}
                                             </p>
+                                            {email.account_email && (
+                                                <p className="text-xs text-gray-400 dark:text-gray-500 mt-0.5">
+                                                    {email.account_email}
+                                                </p>
+                                            )}
                                         </div>
                                         <span className="text-xs text-gray-400 dark:text-gray-500 whitespace-nowrap">
                                             {formatDate(email.date)}

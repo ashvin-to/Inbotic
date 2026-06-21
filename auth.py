@@ -39,32 +39,6 @@ DECODER_SECRET_KEY = os.getenv("DECODER_SECRET_KEY", SECRET_KEY).strip() or SECR
 ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
 
-def _is_bcrypt_hash(hashed: str) -> bool:
-    """Heuristically check if a stored hash is a bcrypt hash."""
-    # bcrypt hashes typically start with $2b$, $2a$, or $2y$
-    return isinstance(hashed, str) and hashed.startswith(("$2b$", "$2a$", "$2y$"))
-
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify a password against its hash.
-
-    Supports both bcrypt (preferred) and legacy SHA-256 hashes that may exist
-    if users were created before bcrypt was installed.
-    """
-    if not isinstance(hashed_password, str):
-        return False
-
-    # If the stored hash looks like bcrypt, verify with bcrypt
-    if _is_bcrypt_hash(hashed_password):
-        try:
-            return bcrypt.checkpw(plain_password.encode("utf-8"), hashed_password.encode("utf-8"))
-        except Exception:
-            # Fall through to False if the hash is malformed
-            return False
-
-    # Otherwise, treat it as legacy SHA-256
-    legacy_sha256 = hashlib.sha256(plain_password.encode()).hexdigest()
-    return legacy_sha256 == hashed_password
-
 def get_password_hash(password: str) -> str:
     """Hash a password using bcrypt, with SHA-256 fallback."""
     try:
